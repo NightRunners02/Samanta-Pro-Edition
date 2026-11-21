@@ -1,0 +1,6 @@
+{
+  "name": "TAFlow",
+  "description": "Integrated Academic Thesis Management Platform for title submission, supervision, seminars, final defense, scoring, plagiarism verification, and graduation.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
