@@ -12,7 +12,7 @@ import {
 import { useAuth } from '../../contexts/AuthContext';
 import { useTheme } from '../../contexts/ThemeContext';
 import { useToast } from '../../contexts/ToastContext';
-import { supabase } from '../../lib/supabase';
+import { formatSupabaseError, supabase } from '../../lib/supabase';
 import type { Department, Program } from '../../types/database';
 
 type AuthView = 'login' | 'register' | 'forgot' | 'reset';
@@ -74,7 +74,10 @@ export function AuthPages() {
     ]);
 
     if (deptError || progError) {
-      const msg = deptError?.message || progError?.message || 'Gagal memuat daftar fakultas & program studi.';
+      const msg = formatSupabaseError(
+        deptError || progError,
+        'Gagal memuat daftar fakultas & program studi.'
+      );
       setRefError(msg);
       setLoadingRef(false);
       return;

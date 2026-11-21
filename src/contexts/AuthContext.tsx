@@ -1,6 +1,6 @@
 import React, { createContext, useCallback, useContext, useEffect, useState } from 'react';
 import type { Session, User } from '@supabase/supabase-js';
-import { getSignedDocumentUrl, isSchemaMissingError, logActivity, supabase } from '../lib/supabase';
+import { formatSupabaseError, getSignedDocumentUrl, isSchemaMissingError, logActivity, supabase } from '../lib/supabase';
 import type { AcademicPeriod, Profile, SystemSettings } from '../types/database';
 
 interface AuthContextValue {
@@ -206,42 +206,46 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       return { error: 'NIM / NIP / NIDN dan kata sandi wajib diisi.' };
     }
 
-    let emailToUse = cleanId;
-    if (!cleanId.includes('@')) {
-      const { data: resolvedEmail, error: lookupError } = await supabase.rpc('login_lookup_email', {
-        p_identifier: cleanId,
-      });
-      if (lookupError) {
-        if (isSchemaMissingError(lookupError)) {
-          setSchemaMissing(true);
-          return { error: 'Database schema belum diperbarui di Supabase.' };
+    try {
+      let emailToUse = cleanId;
+      if (!cleanId.includes('@')) {
+        const { data: resolvedEmail, error: lookupError } = await supabase.rpc('login_lookup_email', {
+          p_identifier: cleanId,
+        });
+        if (lookupError) {
+          if (isSchemaMissingError(lookupError)) {
+            setSchemaMissing(true);
+            return { error: 'Database schema belum diperbarui di Supabase.' };
+          }
+          return { error: formatSupabaseError(lookupError) };
         }
-        return { error: lookupError.message };
+        if (!resolvedEmail) {
+          return { error: 'NIM atau NIP/NIDN tidak ditemukan atau akun tidak aktif.' };
+        }
+        emailToUse = resolvedEmail as string;
       }
-      if (!resolvedEmail) {
-        return { error: 'NIM atau NIP/NIDN tidak ditemukan atau akun tidak aktif.' };
+
+      const { data, error } = await supabase.auth.signInWithPassword({
+        email: emailToUse,
+        password,
+      });
+
+      if (error) {
+        if (error.message.toLowerCase().includes('invalid login credentials')) {
+          return { error: 'NIM / NIP / NIDN atau kata sandi salah.' };
+        }
+        return { error: formatSupabaseError(error) };
       }
-      emailToUse = resolvedEmail as string;
-    }
 
-    const { data, error } = await supabase.auth.signInWithPassword({
-      email: emailToUse,
-      password,
-    });
-
-    if (error) {
-      if (error.message.toLowerCase().includes('invalid login credentials')) {
-        return { error: 'NIM / NIP / NIDN atau kata sandi salah.' };
+      if (data.user) {
+        await fetchProfile(data.user.id);
+        await logActivity('login', 'auth', data.user.id, { method: cleanId.includes('@') ? 'email' : 'nim_nip' });
       }
-      return { error: error.message };
-    }
 
-    if (data.user) {
-      await fetchProfile(data.user.id);
-      await logActivity('login', 'auth', data.user.id, { method: cleanId.includes('@') ? 'email' : 'nim_nip' });
+      return { error: null };
+    } catch (err) {
+      return { error: formatSupabaseError(err) };
     }
-
-    return { error: null };
   };
 
   const signUpStudent = async (payload: {
@@ -253,51 +257,59 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     entryYear: number;
     password: string;
   }) => {
-    const { data: regData, error: regError } = await supabase.rpc('register_student_account', {
-      p_full_name: payload.fullName.trim(),
-      p_nim: payload.nim.trim(),
-      p_password: payload.password,
-      p_department_id: payload.departmentId,
-      p_program_id: payload.programId,
-      p_entry_year: payload.entryYear,
-      p_email: payload.email?.trim() || null,
-    });
+    try {
+      const { data: regData, error: regError } = await supabase.rpc('register_student_account', {
+        p_full_name: payload.fullName.trim(),
+        p_nim: payload.nim.trim(),
+        p_password: payload.password,
+        p_department_id: payload.departmentId,
+        p_program_id: payload.programId,
+        p_entry_year: payload.entryYear,
+        p_email: payload.email?.trim() || null,
+      });
 
-    if (regError) {
-      if (regError.code === 'PGRST202' || regError.message.includes('Could not find the function')) {
-        setSchemaMissing(true);
-        return { error: 'Fungsi registrasi database belum diperbarui. Silakan jalankan ulang 0004_taflow_complete.sql di Supabase SQL Editor.' };
+      if (regError) {
+        if (regError.code === 'PGRST202' || regError.message.includes('Could not find the function')) {
+          setSchemaMissing(true);
+          return { error: 'Fungsi registrasi database belum diperbarui. Silakan jalankan ulang 0004_taflow_complete.sql di Supabase SQL Editor.' };
+        }
+        return { error: formatSupabaseError(regError) };
       }
-      return { error: regError.message };
+
+      const createdEmail = (regData as { email?: string } | null)?.email;
+      if (!createdEmail) {
+        return { error: 'Akun berhasil dibuat, silakan masuk menggunakan NIM Anda.' };
+      }
+
+      const { data: signInData, error: signInError } = await supabase.auth.signInWithPassword({
+        email: createdEmail,
+        password: payload.password,
+      });
+
+      if (signInError) {
+        return { error: formatSupabaseError(signInError) };
+      }
+
+      if (signInData.user) {
+        await fetchProfile(signInData.user.id);
+        await logActivity('register_student', 'auth', signInData.user.id, { nim: payload.nim.trim() });
+      }
+
+      return { error: null };
+    } catch (err) {
+      return { error: formatSupabaseError(err) };
     }
-
-    const createdEmail = (regData as { email?: string } | null)?.email;
-    if (!createdEmail) {
-      return { error: 'Akun berhasil dibuat, silakan masuk menggunakan NIM Anda.' };
-    }
-
-    const { data: signInData, error: signInError } = await supabase.auth.signInWithPassword({
-      email: createdEmail,
-      password: payload.password,
-    });
-
-    if (signInError) {
-      return { error: signInError.message };
-    }
-
-    if (signInData.user) {
-      await fetchProfile(signInData.user.id);
-      await logActivity('register_student', 'auth', signInData.user.id, { nim: payload.nim.trim() });
-    }
-
-    return { error: null };
   };
 
   const sendPasswordReset = async (email: string) => {
-    const { error } = await supabase.auth.resetPasswordForEmail(email.trim().toLowerCase(), {
-      redirectTo: `${window.location.origin}/`,
-    });
-    return { error: error ? error.message : null };
+    try {
+      const { error } = await supabase.auth.resetPasswordForEmail(email.trim().toLowerCase(), {
+        redirectTo: `${window.location.origin}/`,
+      });
+      return { error: error ? formatSupabaseError(error) : null };
+    } catch (err) {
+      return { error: formatSupabaseError(err) };
+    }
   };
 
   const updatePassword = async (newPassword: string) => {

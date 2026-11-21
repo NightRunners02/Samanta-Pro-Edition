@@ -1,21 +1,39 @@
 import { createClient } from '@supabase/supabase-js';
 import type { DocumentCategory, ThesisDocument } from '../types/database';
 
-const rawSupabaseUrl = (import.meta.env.VITE_SUPABASE_URL as string | undefined)?.trim();
-const supabaseUrl = rawSupabaseUrl
-  ? rawSupabaseUrl.replace(/\/rest\/v1\/?$/i, '').replace(/\/+$/, '')
-  : undefined;
-const supabaseAnonKey = (import.meta.env.VITE_SUPABASE_ANON_KEY as string | undefined)?.trim();
+const DEFAULT_SUPABASE_URL = 'https://tfmekdwgyadlvoqlfqus.supabase.co';
+const DEFAULT_SUPABASE_ANON_KEY =
+  'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRmbWVrZHdneWFkbHZvcWxmcXVzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTUyNjEzNjUsImV4cCI6MjExMDgzNzM2NX0.Tp-gDEAjNVIW2DG9NbmuSrXridPp4sr1C_GyMqn-C_k';
 
-if (!supabaseUrl || !supabaseAnonKey) {
-  console.warn(
-    'Missing VITE_SUPABASE_URL or VITE_SUPABASE_ANON_KEY. Configure them in .env to connect to Supabase.'
-  );
+function sanitizeEnvValue(raw: string | undefined): string | undefined {
+  if (!raw) return undefined;
+  const cleaned = raw.trim().replace(/^["']+|["']+$/g, '').trim();
+  return cleaned || undefined;
 }
 
+function normalizeSupabaseUrl(raw: string | undefined): string {
+  const cleaned = sanitizeEnvValue(raw);
+  if (!cleaned || cleaned.includes('your-project-ref') || cleaned.includes('placeholder.supabase.co')) {
+    return DEFAULT_SUPABASE_URL;
+  }
+  const withProtocol = /^https?:\/\//i.test(cleaned) ? cleaned : `https://${cleaned}`;
+  return withProtocol.replace(/\/rest\/v1\/?$/i, '').replace(/\/+$/, '');
+}
+
+function normalizeAnonKey(raw: string | undefined): string {
+  const cleaned = sanitizeEnvValue(raw);
+  if (!cleaned || cleaned.includes('your-supabase-anon-key') || cleaned === 'placeholder-key') {
+    return DEFAULT_SUPABASE_ANON_KEY;
+  }
+  return cleaned;
+}
+
+export const supabaseUrl = normalizeSupabaseUrl(import.meta.env.VITE_SUPABASE_URL as string | undefined);
+export const supabaseAnonKey = normalizeAnonKey(import.meta.env.VITE_SUPABASE_ANON_KEY as string | undefined);
+
 export const supabase = createClient(
-  supabaseUrl || 'https://placeholder.supabase.co',
-  supabaseAnonKey || 'placeholder-key',
+  supabaseUrl,
+  supabaseAnonKey,
   {
     auth: {
       persistSession: true,
@@ -29,6 +47,28 @@ export const supabase = createClient(
     },
   }
 );
+
+export function formatSupabaseError(error: unknown, fallback = 'Terjadi kesalahan saat menghubungi server.'): string {
+  const rawMessage =
+    typeof error === 'string'
+      ? error
+      : error && typeof error === 'object' && 'message' in error && typeof (error as { message: unknown }).message === 'string'
+        ? (error as { message: string }).message
+        : '';
+
+  const lower = rawMessage.toLowerCase();
+  if (
+    lower.includes('failed to fetch') ||
+    lower.includes('networkerror') ||
+    lower.includes('network request failed') ||
+    lower.includes('load failed') ||
+    lower.includes('fetch') && lower.includes('typeerror')
+  ) {
+    return 'Tidak dapat terhubung ke server database Supabase. Periksa koneksi internet Anda atau pastikan konfigurasi VITE_SUPABASE_URL valid.';
+  }
+
+  return rawMessage || fallback;
+}
 
 export function isSchemaMissingError(error: unknown): boolean {
   if (!error || typeof error !== 'object') return false;
