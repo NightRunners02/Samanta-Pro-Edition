@@ -14,9 +14,9 @@ export function LecturerDashboard({ onNavigate }: { onNavigate: (pageId: string)
   const [sessions, setSessions] = useState<SupervisionSession[]>([]);
   const [exams, setExams] = useState<Array<ExaminerAssignment & { schedule?: { exam_date: string; start_time: string; room_name: string; exam_type: string; status: string }; thesis?: { title: string; student?: { full_name: string; nim_nip: string } } }>>([]);
 
-  const loadData = useCallback(async () => {
+  const loadData = useCallback(async (withLoader = true) => {
     if (!profile?.id) return;
-    setLoading(true);
+    if (withLoader) setLoading(true);
     const [{ data: supData }, { data: sessData }, { data: exData }] = await Promise.all([
       supabase
         .from('thesis_supervisors')
@@ -27,7 +27,7 @@ export function LecturerDashboard({ onNavigate }: { onNavigate: (pageId: string)
         .from('supervision_sessions')
         .select('*, student:profiles!supervision_sessions_student_id_fkey(*)')
         .eq('lecturer_id', profile.id)
-        .order('scheduled_date', { ascending: true }),
+        .order('created_at', { ascending: false }),
       supabase
         .from('examiner_assignments')
         .select('*, schedule:exam_schedules(*), thesis:thesis_submissions(title, student:profiles!thesis_submissions_student_id_fkey(full_name, nim_nip))')
@@ -37,12 +37,24 @@ export function LecturerDashboard({ onNavigate }: { onNavigate: (pageId: string)
     setSupervisees((supData || []) as ThesisSupervisor[]);
     setSessions((sessData || []) as SupervisionSession[]);
     setExams((exData || []) as typeof exams);
-    setLoading(false);
+    if (withLoader) setLoading(false);
   }, [profile?.id]);
 
   useEffect(() => {
     loadData();
-  }, [loadData]);
+    if (!profile?.id) return;
+
+    const channel = supabase
+      .channel(`lecturer_dashboard_${profile.id}`)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'supervision_sessions' }, () => loadData(false))
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'thesis_supervisors' }, () => loadData(false))
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'examiner_assignments' }, () => loadData(false))
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [loadData, profile?.id]);
 
   if (loading) return <CardGridSkeleton count={4} />;
 

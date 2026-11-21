@@ -9,6 +9,7 @@ import { useToast } from '../../contexts/ToastContext';
 import { logActivity, sendNotification, supabase, uploadPrivateDocument } from '../../lib/supabase';
 import { formatDateTime } from '../../lib/utils';
 import type {
+  LecturerQuotaSummary,
   Profile,
   Program,
   SubmissionRequirement,
@@ -26,6 +27,7 @@ export function TitleSubmissionPage() {
   const [program, setProgram] = useState<Program | null>(null);
   const [requirements, setRequirements] = useState<SubmissionRequirement[]>([]);
   const [lecturers, setLecturers] = useState<Profile[]>([]);
+  const [quotaMap, setQuotaMap] = useState<Record<string, LecturerQuotaSummary>>({});
   const [proposalDoc, setProposalDoc] = useState<ThesisDocument | null>(null);
   const [previewOpen, setPreviewOpen] = useState(false);
 
@@ -45,7 +47,7 @@ export function TitleSubmissionPage() {
     if (!profile?.id) return;
     setLoading(true);
 
-    const [{ data: subData }, { data: progData }, { data: reqData }, { data: lecData }] =
+    const [{ data: subData }, { data: progData }, { data: reqData }, { data: lecData }, { data: quotaData }] =
       await Promise.all([
         supabase
           .from('thesis_submissions')
@@ -69,6 +71,7 @@ export function TitleSubmissionPage() {
           .in('role_code', ['supervisor', 'examiner'])
           .eq('is_active', true)
           .order('full_name'),
+        supabase.rpc('get_lecturer_quota_summary'),
       ]);
 
     const currentProg = (progData as Program) || null;
@@ -78,6 +81,13 @@ export function TitleSubmissionPage() {
     );
     setRequirements(filteredReqs);
     setLecturers((lecData || []) as Profile[]);
+    if (Array.isArray(quotaData)) {
+      const qMap: Record<string, LecturerQuotaSummary> = {};
+      for (const q of quotaData as LecturerQuotaSummary[]) {
+        qMap[q.id] = q;
+      }
+      setQuotaMap(qMap);
+    }
 
     if (subData) {
       const s = subData as ThesisSubmission;
@@ -378,11 +388,19 @@ export function TitleSubmissionPage() {
                   className="w-full px-3 py-2 text-xs rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 disabled:opacity-60"
                 >
                   <option value="">-- Pilih Dosen --</option>
-                  {lecturers.map((l) => (
-                    <option key={l.id} value={l.id}>
-                      {l.full_name} {l.research_field ? `(${l.research_field})` : ''}
-                    </option>
-                  ))}
+                  {lecturers.map((l) => {
+                    const q = quotaMap[l.id];
+                    const quotaText = q
+                      ? q.is_available
+                        ? ` · Sisa Kuota ${q.available_quota}/${q.max_quota}`
+                        : ` · Kuota Penuh (${q.active_count}/${q.max_quota})`
+                      : '';
+                    return (
+                      <option key={l.id} value={l.id}>
+                        {l.full_name} {l.research_field ? `(${l.research_field})` : ''}{quotaText}
+                      </option>
+                    );
+                  })}
                 </select>
               </div>
               <div>
@@ -398,11 +416,19 @@ export function TitleSubmissionPage() {
                   <option value="">-- Opsional --</option>
                   {lecturers
                     .filter((l) => l.id !== proposedSup1)
-                    .map((l) => (
-                      <option key={l.id} value={l.id}>
-                        {l.full_name}
-                      </option>
-                    ))}
+                    .map((l) => {
+                      const q = quotaMap[l.id];
+                      const quotaText = q
+                        ? q.is_available
+                          ? ` · Sisa Kuota ${q.available_quota}/${q.max_quota}`
+                          : ` · Kuota Penuh (${q.active_count}/${q.max_quota})`
+                        : '';
+                      return (
+                        <option key={l.id} value={l.id}>
+                          {l.full_name}{quotaText}
+                        </option>
+                      );
+                    })}
                 </select>
               </div>
             </>

@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Bell,
   ChevronRight,
@@ -10,6 +10,8 @@ import {
   Search,
   Settings,
   Sun,
+  UserCheck,
+  Users,
   X,
   Wrench,
 } from 'lucide-react';
@@ -18,7 +20,8 @@ import { useAuth } from '../../contexts/AuthContext';
 import { useTheme } from '../../contexts/ThemeContext';
 import { supabase } from '../../lib/supabase';
 import { cn, formatDateTime, formatRoleLabel } from '../../lib/utils';
-import type { AppNotification } from '../../types/database';
+import type { AppNotification, LecturerQuotaSummary } from '../../types/database';
+import { Modal } from '../ui/Modal';
 
 interface AppShellProps {
   activePage: string;
@@ -37,6 +40,8 @@ export function AppShell({ activePage, onNavigate, children }: AppShellProps) {
   const [profileMenuOpen, setProfileMenuOpen] = useState(false);
   const [avatarLoadError, setAvatarLoadError] = useState(false);
   const [notifications, setNotifications] = useState<AppNotification[]>([]);
+  const [lecturerQuotas, setLecturerQuotas] = useState<LecturerQuotaSummary[]>([]);
+  const [selectedQuotaLecturer, setSelectedQuotaLecturer] = useState<LecturerQuotaSummary | null>(null);
 
   useEffect(() => {
     setAvatarLoadError(false);
@@ -100,6 +105,79 @@ export function AppShell({ activePage, onNavigate, children }: AppShellProps) {
       supabase.removeChannel(channel);
     };
   }, [profile?.id]);
+
+  // Real-time lecturer availability & supervision quota list in sidebar
+  const loadLecturerQuotas = useCallback(async () => {
+    if (!profile?.id) return;
+
+    const { data, error } = await supabase.rpc('get_lecturer_quota_summary');
+    if (!error && Array.isArray(data)) {
+      setLecturerQuotas(data as LecturerQuotaSummary[]);
+      return;
+    }
+
+    // Fallback if get_lecturer_quota_summary RPC has not been applied yet
+    const [{ data: lecData }, { data: supData }] = await Promise.all([
+      supabase
+        .from('profiles')
+        .select('id, full_name, title_prefix, title_suffix, role_code, research_field, consultation_schedule, max_supervisee_quota, program:programs(name)')
+        .in('role_code', ['supervisor', 'examiner'])
+        .eq('is_active', true)
+        .order('full_name'),
+      supabase.from('thesis_supervisors').select('lecturer_id').eq('status', 'active'),
+    ]);
+
+    const loadMap: Record<string, number> = {};
+    for (const s of supData || []) {
+      loadMap[s.lecturer_id] = (loadMap[s.lecturer_id] || 0) + 1;
+    }
+
+    const mapped: LecturerQuotaSummary[] = (lecData || []).map((l) => {
+      const maxQ = l.max_supervisee_quota ?? 10;
+      const activeC = loadMap[l.id] || 0;
+      const progObj = Array.isArray(l.program) ? l.program[0] : l.program;
+      return {
+        id: l.id,
+        full_name: l.full_name,
+        title_prefix: l.title_prefix,
+        title_suffix: l.title_suffix,
+        role_code: l.role_code as LecturerQuotaSummary['role_code'],
+        program_name: (progObj as { name?: string } | null)?.name || null,
+        research_field: l.research_field,
+        consultation_schedule: l.consultation_schedule,
+        max_quota: maxQ,
+        active_count: activeC,
+        available_quota: Math.max(0, maxQ - activeC),
+        is_available: activeC < maxQ,
+      };
+    });
+    mapped.sort((a, b) => Number(b.is_available) - Number(a.is_available) || b.available_quota - a.available_quota);
+    setLecturerQuotas(mapped);
+  }, [profile?.id]);
+
+  useEffect(() => {
+    loadLecturerQuotas();
+    if (!profile?.id) return;
+
+    const channel = supabase
+      .channel(`sidebar_lecturer_quotas_${profile.id}`)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'thesis_supervisors' }, () => {
+        loadLecturerQuotas();
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'profiles' }, () => {
+        loadLecturerQuotas();
+      })
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [loadLecturerQuotas, profile?.id]);
+
+  const availableLecturersCount = useMemo(
+    () => lecturerQuotas.filter((l) => l.is_available).length,
+    [lecturerQuotas]
+  );
 
   const unreadCount = notifications.filter((n) => !n.is_read).length;
 
@@ -234,6 +312,75 @@ export function AppShell({ activePage, onNavigate, children }: AppShellProps) {
               </div>
             </div>
           ))}
+
+          {/* Kuota Pembimbing — mengikuti struktur grup sidebar */}
+          <div className="space-y-1">
+            {!collapsed && (
+              <p className="px-3 text-[11px] font-medium text-slate-400 tracking-wide">
+                Kuota Pembimbing ({availableLecturersCount}/{lecturerQuotas.length})
+              </p>
+            )}
+            <div className="space-y-0.5">
+              {collapsed ? (
+                <button
+                  type="button"
+                  title={`Kuota Pembimbing (${availableLecturersCount}/${lecturerQuotas.length} tersedia)`}
+                  onClick={() => setCollapsed(false)}
+                  className="w-full flex items-center justify-center px-2 py-2 rounded-lg text-xs font-medium text-slate-300 hover:text-white hover:bg-slate-800/80 transition-colors whitespace-nowrap"
+                >
+                  <Users className="w-4 h-4 shrink-0 text-slate-400" />
+                </button>
+              ) : lecturerQuotas.length === 0 ? (
+                <p className="px-3 py-2 text-xs text-slate-400">
+                  Belum ada data dosen
+                </p>
+              ) : (
+                lecturerQuotas.map((lec) => {
+                  const displayName = [lec.title_prefix, lec.full_name, lec.title_suffix]
+                    .filter(Boolean)
+                    .join(' ');
+                  const isSelected = selectedQuotaLecturer?.id === lec.id;
+                  return (
+                    <button
+                      key={lec.id}
+                      type="button"
+                      title={`${displayName} — ${lec.is_available ? `Sisa ${lec.available_quota} kuota` : 'Kuota penuh'} (${lec.active_count}/${lec.max_quota})`}
+                      onClick={() => {
+                        setSelectedQuotaLecturer(lec);
+                        setMobileOpen(false);
+                      }}
+                      className={cn(
+                        'w-full flex items-center gap-3 px-3 py-2 rounded-lg text-xs font-medium transition-colors whitespace-nowrap',
+                        isSelected
+                          ? 'bg-blue-700 text-white'
+                          : 'text-slate-300 hover:text-white hover:bg-slate-800/80'
+                      )}
+                    >
+                      <UserCheck
+                        className={cn(
+                          'w-4 h-4 shrink-0',
+                          isSelected ? 'text-cyan-300' : 'text-slate-400'
+                        )}
+                      />
+                      <span className="truncate flex-1 text-left">{displayName}</span>
+                      <span
+                        className={cn(
+                          'text-[11px] font-mono tabular-nums shrink-0',
+                          isSelected
+                            ? 'text-cyan-200'
+                            : lec.is_available
+                              ? 'text-cyan-300'
+                              : 'text-rose-400'
+                        )}
+                      >
+                        {lec.active_count}/{lec.max_quota}
+                      </span>
+                    </button>
+                  );
+                })
+              )}
+            </div>
+          </div>
         </nav>
 
         {/* Collapse Control & Period Info */}
@@ -476,6 +623,111 @@ export function AppShell({ activePage, onNavigate, children }: AppShellProps) {
           {children}
         </main>
       </div>
+
+      {/* Lecturer Quota Detail Modal */}
+      <Modal
+        open={Boolean(selectedQuotaLecturer)}
+        onClose={() => setSelectedQuotaLecturer(null)}
+        title={
+          selectedQuotaLecturer
+            ? [selectedQuotaLecturer.title_prefix, selectedQuotaLecturer.full_name, selectedQuotaLecturer.title_suffix]
+                .filter(Boolean)
+                .join(' ')
+            : ''
+        }
+        subtitle={selectedQuotaLecturer?.program_name || 'Informasi Kuota Dosen Pembimbing'}
+        maxWidth="sm"
+        footer={
+          <>
+            <button
+              type="button"
+              onClick={() => setSelectedQuotaLecturer(null)}
+              className="px-4 py-2 text-xs font-medium rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800"
+            >
+              Tutup
+            </button>
+            {roleCode === 'student' && selectedQuotaLecturer?.is_available && (
+              <button
+                type="button"
+                onClick={() => {
+                  setSelectedQuotaLecturer(null);
+                  onNavigate('title-submission');
+                }}
+                className="px-4 py-2 text-xs font-semibold rounded-lg bg-blue-700 hover:bg-blue-800 text-white"
+              >
+                Buka Pengajuan Judul
+              </button>
+            )}
+            {(roleCode === 'super_admin' || roleCode === 'program_admin') && (
+              <button
+                type="button"
+                onClick={() => {
+                  setSelectedQuotaLecturer(null);
+                  onNavigate('supervisors');
+                }}
+                className="px-4 py-2 text-xs font-semibold rounded-lg bg-blue-700 hover:bg-blue-800 text-white"
+              >
+                Kelola Pembimbing
+              </button>
+            )}
+          </>
+        }
+      >
+        {selectedQuotaLecturer && (
+          <div className="space-y-4 text-xs">
+            <div className="grid grid-cols-3 gap-3 p-3 rounded-lg bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-800">
+              <div>
+                <p className="text-[11px] text-slate-500 dark:text-slate-400">Terisi</p>
+                <p className="text-sm font-mono font-bold text-slate-900 dark:text-slate-100 mt-0.5">
+                  {selectedQuotaLecturer.active_count}
+                </p>
+              </div>
+              <div>
+                <p className="text-[11px] text-slate-500 dark:text-slate-400">Maksimal</p>
+                <p className="text-sm font-mono font-bold text-slate-900 dark:text-slate-100 mt-0.5">
+                  {selectedQuotaLecturer.max_quota}
+                </p>
+              </div>
+              <div>
+                <p className="text-[11px] text-slate-500 dark:text-slate-400">Sisa Kuota</p>
+                <p
+                  className={cn(
+                    'text-sm font-mono font-bold mt-0.5',
+                    selectedQuotaLecturer.is_available
+                      ? 'text-emerald-600 dark:text-emerald-400'
+                      : 'text-rose-600 dark:text-rose-400'
+                  )}
+                >
+                  {selectedQuotaLecturer.is_available
+                    ? `${selectedQuotaLecturer.available_quota} Tersedia`
+                    : 'Penuh'}
+                </p>
+              </div>
+            </div>
+
+            <div className="space-y-2.5">
+              <div>
+                <p className="text-[11px] text-slate-500 dark:text-slate-400">Program Studi</p>
+                <p className="font-medium text-slate-900 dark:text-slate-100 mt-0.5">
+                  {selectedQuotaLecturer.program_name || 'Lintas Program Studi'}
+                </p>
+              </div>
+              <div>
+                <p className="text-[11px] text-slate-500 dark:text-slate-400">Bidang Penelitian</p>
+                <p className="font-medium text-slate-900 dark:text-slate-100 mt-0.5">
+                  {selectedQuotaLecturer.research_field || 'Belum dicantumkan'}
+                </p>
+              </div>
+              <div>
+                <p className="text-[11px] text-slate-500 dark:text-slate-400">Jadwal Konsultasi</p>
+                <p className="font-medium text-slate-900 dark:text-slate-100 mt-0.5">
+                  {selectedQuotaLecturer.consultation_schedule || 'Sesuai perjanjian melalui Sesi Bimbingan'}
+                </p>
+              </div>
+            </div>
+          </div>
+        )}
+      </Modal>
     </div>
   );
 }

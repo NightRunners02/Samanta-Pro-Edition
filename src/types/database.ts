@@ -297,6 +297,7 @@ export interface SupervisionSession {
   updated_at: string;
   student?: Profile;
   lecturer?: Profile;
+  thesis?: ThesisSubmission;
   attachment?: ThesisDocument | null;
 }
 
@@ -489,4 +490,19 @@ export interface SystemSettings {
   };
   maintenance_mode: boolean;
   updated_at: string;
+}
+
+export interface LecturerQuotaSummary {
+  id: string;
+  full_name: string;
+  title_prefix: string | null;
+  title_suffix: string | null;
+  role_code: RoleCode;
+  program_name: string | null;
+  research_field: string | null;
+  consultation_schedule: string | null;
+  max_quota: number;
+  active_count: number;
+  available_quota: number;
+  is_available: boolean;
 }

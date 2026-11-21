@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useState } from 'react';
-import { Calendar, CheckCircle2, Eye, XCircle } from 'lucide-react';
+import { Calendar, CheckCircle2, Clock, Eye, Loader2, XCircle } from 'lucide-react';
 import { DataTable, type ColumnDef } from '../../components/ui/DataTable';
 import { DocumentViewerModal } from '../../components/ui/DocumentViewerModal';
 import { Modal } from '../../components/ui/Modal';
 import { StatusBadge } from '../../components/ui/StatusBadge';
+import { UserAvatar } from '../../components/ui/UserAvatar';
 import { useAuth } from '../../contexts/AuthContext';
 import { useToast } from '../../contexts/ToastContext';
-import { logActivity, sendNotification, supabase } from '../../lib/supabase';
+import { getSignedAvatarUrls, logActivity, sendNotification, supabase } from '../../lib/supabase';
 import { formatDate } from '../../lib/utils';
 import type { GuidanceStatus, SupervisionSession, ThesisDocument } from '../../types/database';
 
@@ -16,6 +17,8 @@ export function GuidanceManagementPage() {
 
   const [loading, setLoading] = useState(true);
   const [sessions, setSessions] = useState<SupervisionSession[]>([]);
+  const [avatarUrls, setAvatarUrls] = useState<Record<string, string>>({});
+  const [statusFilter, setStatusFilter] = useState<string>('all');
   const [activeSession, setActiveSession] = useState<SupervisionSession | null>(null);
   const [lecturerNotes, setLecturerNotes] = useState('');
   const [altDate, setAltDate] = useState('');
@@ -23,24 +26,100 @@ export function GuidanceManagementPage() {
   const [saving, setSaving] = useState(false);
   const [previewDoc, setPreviewDoc] = useState<ThesisDocument | null>(null);
 
-  const loadData = useCallback(async () => {
-    if (!profile?.id) return;
-    setLoading(true);
-    const { data } = await supabase
-      .from('supervision_sessions')
-      .select('*, student:profiles!supervision_sessions_student_id_fkey(*), attachment:thesis_documents(*)')
-      .eq('lecturer_id', profile.id)
-      .order('scheduled_date', { ascending: false });
-    setSessions((data || []) as SupervisionSession[]);
-    setLoading(false);
-  }, [profile?.id]);
+  const loadData = useCallback(
+    async (withLoader = true) => {
+      if (!profile?.id) return;
+      if (withLoader) setLoading(true);
+
+      const { data: supData } = await supabase
+        .from('thesis_supervisors')
+        .select('thesis_id')
+        .eq('lecturer_id', profile.id)
+        .eq('status', 'active');
+
+      const thesisIds = Array.from(new Set((supData || []).map((s) => s.thesis_id)));
+      const orFilter =
+        thesisIds.length > 0
+          ? `lecturer_id.eq.${profile.id},thesis_id.in.(${thesisIds.join(',')})`
+          : `lecturer_id.eq.${profile.id}`;
+
+      let { data, error } = await supabase
+        .from('supervision_sessions')
+        .select(
+          '*, student:profiles!supervision_sessions_student_id_fkey(*), lecturer:profiles!supervision_sessions_lecturer_id_fkey(*), thesis:thesis_submissions(id, title, current_stage), attachment:thesis_documents(*)'
+        )
+        .or(orFilter)
+        .order('created_at', { ascending: false });
+
+      if (error) {
+        const fallback = await supabase
+          .from('supervision_sessions')
+          .select('*, student:profiles!supervision_sessions_student_id_fkey(*), lecturer:profiles!supervision_sessions_lecturer_id_fkey(*)')
+          .eq('lecturer_id', profile.id)
+          .order('created_at', { ascending: false });
+        data = fallback.data as typeof data;
+        error = fallback.error;
+      }
+
+      if (error) {
+        showToast('Gagal memuat sesi bimbingan', 'error', error.message);
+        if (withLoader) setLoading(false);
+        return;
+      }
+
+      const list = (data || []) as SupervisionSession[];
+      setSessions(list);
+
+      const paths = list
+        .map((s) => s.student?.avatar_url)
+        .filter((p): p is string => Boolean(p));
+      if (paths.length > 0) {
+        const signedMap = await getSignedAvatarUrls(paths);
+        const byStudent: Record<string, string> = {};
+        for (const s of list) {
+          if (s.student?.avatar_url && signedMap[s.student.avatar_url]) {
+            byStudent[s.student_id] = signedMap[s.student.avatar_url];
+          }
+        }
+        setAvatarUrls(byStudent);
+      } else {
+        setAvatarUrls({});
+      }
+
+      if (withLoader) setLoading(false);
+    },
+    [profile?.id, showToast]
+  );
 
   useEffect(() => {
     loadData();
-  }, [loadData]);
+    if (!profile?.id) return;
+
+    const channel = supabase
+      .channel(`lecturer_guidance_${profile.id}`)
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'supervision_sessions' },
+        () => {
+          loadData(false);
+        }
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'thesis_supervisors', filter: `lecturer_id=eq.${profile.id}` },
+        () => {
+          loadData(false);
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [loadData, profile?.id]);
 
   const handleDecision = async (status: GuidanceStatus) => {
-    if (!profile || !activeSession) return;
+    if (!profile || !activeSession || saving) return;
     setSaving(true);
 
     const history = [
@@ -72,8 +151,18 @@ export function GuidanceManagementPage() {
 
     await sendNotification({
       userId: activeSession.student_id,
-      title: `Bimbingan ${status === 'scheduled' ? 'Dijadwalkan' : status === 'completed' ? 'Selesai' : status === 'rescheduled' ? 'Dijadwalkan Ulang' : 'Ditolak'}`,
-      message: lecturerNotes.trim() || `Dosen pembimbing memperbarui sesi bimbingan "${activeSession.topic}".`,
+      title: `Bimbingan ${
+        status === 'scheduled'
+          ? 'Dijadwalkan'
+          : status === 'completed'
+            ? 'Selesai'
+            : status === 'rescheduled'
+              ? 'Dijadwalkan Ulang'
+              : 'Ditolak'
+      }`,
+      message:
+        lecturerNotes.trim() ||
+        `Dosen pembimbing memperbarui sesi bimbingan "${activeSession.topic}".`,
       category: 'guidance',
       entityType: 'supervision_sessions',
       entityId: activeSession.id,
@@ -83,8 +172,12 @@ export function GuidanceManagementPage() {
     setActiveSession(null);
     setLecturerNotes('');
     showToast('Sesi bimbingan diperbarui', 'success');
-    loadData();
+    loadData(false);
   };
+
+  const pendingCount = sessions.filter((s) => s.status === 'requested').length;
+  const filteredSessions =
+    statusFilter === 'all' ? sessions : sessions.filter((s) => s.status === statusFilter);
 
   const columns: ColumnDef<SupervisionSession>[] = [
     {
@@ -92,9 +185,12 @@ export function GuidanceManagementPage() {
       header: 'Mahasiswa',
       sortValue: (r) => r.student?.full_name || '',
       render: (r) => (
-        <div>
-          <p className="font-medium">{r.student?.full_name}</p>
-          <p className="text-[11px] font-mono text-slate-500">{r.student?.nim_nip}</p>
+        <div className="flex items-center gap-2.5">
+          <UserAvatar name={r.student?.full_name} src={avatarUrls[r.student_id]} size="sm" />
+          <div className="min-w-0">
+            <p className="font-medium truncate">{r.student?.full_name || 'Mahasiswa'}</p>
+            <p className="text-[11px] font-mono text-slate-500">{r.student?.nim_nip || '—'}</p>
+          </div>
         </div>
       ),
     },
@@ -102,9 +198,18 @@ export function GuidanceManagementPage() {
       key: 'topic',
       header: 'Bab & Topik',
       render: (r) => (
-        <div>
-          <p className="font-medium">Bab {r.chapter_number || '—'} · {r.topic}</p>
-          {r.student_notes && <p className="text-[11px] text-slate-500 truncate max-w-xs">{r.student_notes}</p>}
+        <div className="max-w-sm">
+          <p className="font-medium">
+            Bab {r.chapter_number || '—'} · {r.topic}
+          </p>
+          {r.student_notes && (
+            <p className="text-[11px] text-slate-500 truncate">{r.student_notes}</p>
+          )}
+          {r.lecturer_id !== profile?.id && r.lecturer?.full_name && (
+            <p className="text-[10px] text-blue-700 dark:text-cyan-400 mt-0.5">
+              Ditujukan ke: {r.lecturer.full_name}
+            </p>
+          )}
         </div>
       ),
     },
@@ -158,38 +263,68 @@ export function GuidanceManagementPage() {
 
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-xl font-bold tracking-tight">Manajemen Sesi Bimbingan</h1>
-        <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-          Setujui jadwal, tentukan jadwal alternatif, berikan catatan revisi, atau tandai sesi selesai.
-        </p>
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+        <div>
+          <h1 className="text-xl font-bold tracking-tight">Manajemen Sesi Bimbingan</h1>
+          <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+            Setujui jadwal, tentukan jadwal alternatif, berikan catatan revisi, atau tandai sesi selesai secara realtime.
+          </p>
+        </div>
+        {pendingCount > 0 && (
+          <button
+            type="button"
+            onClick={() => setStatusFilter('requested')}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/30 text-amber-800 dark:text-amber-300 text-xs font-medium self-start"
+          >
+            <Clock className="w-3.5 h-3.5" />
+            {pendingCount} Permintaan Menunggu Tanggapan
+          </button>
+        )}
       </div>
 
       <DataTable
-        data={sessions}
+        data={filteredSessions}
         columns={columns}
         keyField={(r) => r.id}
         loading={loading}
-        searchPlaceholder="Cari mahasiswa atau topik..."
+        searchPlaceholder="Cari mahasiswa, NIM, atau topik..."
         searchFilter={(r, q) =>
           (r.student?.full_name || '').toLowerCase().includes(q) ||
+          (r.student?.nim_nip || '').toLowerCase().includes(q) ||
           r.topic.toLowerCase().includes(q)
         }
+        toolbarExtra={
+          <select
+            value={statusFilter}
+            onChange={(e) => setStatusFilter(e.target.value)}
+            className="px-2.5 py-1.5 text-xs rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900"
+          >
+            <option value="all">Semua Status ({sessions.length})</option>
+            <option value="requested">Menunggu ({pendingCount})</option>
+            <option value="scheduled">Dijadwalkan</option>
+            <option value="rescheduled">Dijadwalkan Ulang</option>
+            <option value="completed">Selesai</option>
+            <option value="rejected">Ditolak</option>
+          </select>
+        }
         emptyTitle="Belum ada sesi bimbingan"
-        emptyDescription="Permintaan bimbingan dari mahasiswa bimbingan Anda akan tampil di sini."
+        emptyDescription="Permintaan bimbingan dari mahasiswa bimbingan Anda akan tampil di sini secara realtime."
       />
 
       <Modal
         open={Boolean(activeSession)}
-        onClose={() => setActiveSession(null)}
+        onClose={() => !saving && setActiveSession(null)}
         title="Tanggapi Sesi Bimbingan"
         subtitle={activeSession ? `${activeSession.student?.full_name} — ${activeSession.topic}` : ''}
       >
         {activeSession && (
           <div className="space-y-4 text-xs">
-            <div className="p-3 rounded-lg bg-slate-50 dark:bg-slate-950/50 border border-slate-200 dark:border-slate-800">
-              <p className="font-medium text-slate-500">Catatan Mahasiswa:</p>
-              <p className="mt-1">{activeSession.student_notes || 'Tidak ada catatan tambahan.'}</p>
+            <div className="p-3 rounded-lg bg-slate-50 dark:bg-slate-950/50 border border-slate-200 dark:border-slate-800 space-y-1">
+              <p className="font-medium text-slate-500">
+                Jadwal Diajukan: <span className="font-mono text-slate-800 dark:text-slate-200">{formatDate(activeSession.scheduled_date)} · {activeSession.scheduled_time.slice(0, 5)}</span>
+              </p>
+              <p className="font-medium text-slate-500 pt-1">Catatan Mahasiswa:</p>
+              <p>{activeSession.student_notes || 'Tidak ada catatan tambahan.'}</p>
             </div>
 
             <div>
@@ -229,7 +364,7 @@ export function GuidanceManagementPage() {
                 type="button"
                 disabled={saving}
                 onClick={() => handleDecision('rejected')}
-                className="inline-flex items-center gap-1 px-3 py-2 rounded-lg border border-rose-200 text-rose-700 hover:bg-rose-50"
+                className="inline-flex items-center gap-1 px-3 py-2 rounded-lg border border-rose-200 text-rose-700 hover:bg-rose-50 disabled:opacity-50"
               >
                 <XCircle className="w-3.5 h-3.5" />
                 Tolak
@@ -238,7 +373,7 @@ export function GuidanceManagementPage() {
                 type="button"
                 disabled={saving}
                 onClick={() => handleDecision('rescheduled')}
-                className="inline-flex items-center gap-1 px-3 py-2 rounded-lg border border-amber-200 text-amber-700 hover:bg-amber-50"
+                className="inline-flex items-center gap-1 px-3 py-2 rounded-lg border border-amber-200 text-amber-700 hover:bg-amber-50 disabled:opacity-50"
               >
                 <Calendar className="w-3.5 h-3.5" />
                 Jadwal Alternatif
@@ -247,7 +382,7 @@ export function GuidanceManagementPage() {
                 type="button"
                 disabled={saving}
                 onClick={() => handleDecision('scheduled')}
-                className="inline-flex items-center gap-1 px-3.5 py-2 rounded-lg border border-blue-200 text-blue-700 hover:bg-blue-50"
+                className="inline-flex items-center gap-1 px-3.5 py-2 rounded-lg border border-blue-200 text-blue-700 hover:bg-blue-50 disabled:opacity-50"
               >
                 Terima Jadwal
               </button>
@@ -255,9 +390,9 @@ export function GuidanceManagementPage() {
                 type="button"
                 disabled={saving}
                 onClick={() => handleDecision('completed')}
-                className="inline-flex items-center gap-1 px-4 py-2 font-medium rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white"
+                className="inline-flex items-center gap-1 px-4 py-2 font-medium rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white disabled:opacity-50"
               >
-                <CheckCircle2 className="w-3.5 h-3.5" />
+                {saving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <CheckCircle2 className="w-3.5 h-3.5" />}
                 Tandai Selesai
               </button>
             </div>

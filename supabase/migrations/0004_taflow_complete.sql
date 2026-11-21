@@ -1274,6 +1274,59 @@ $$;
 
 GRANT EXECUTE ON FUNCTION public.log_user_activity(TEXT, TEXT, UUID, JSONB) TO authenticated;
 
+-- Lecturer availability & quota summary RPC (safe for all authenticated roles including students)
+CREATE OR REPLACE FUNCTION public.get_lecturer_quota_summary()
+RETURNS TABLE (
+  id UUID,
+  full_name TEXT,
+  title_prefix TEXT,
+  title_suffix TEXT,
+  role_code TEXT,
+  program_name TEXT,
+  research_field TEXT,
+  consultation_schedule TEXT,
+  max_quota INTEGER,
+  active_count INTEGER,
+  available_quota INTEGER,
+  is_available BOOLEAN
+)
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  WITH active_loads AS (
+    SELECT lecturer_id, COUNT(*)::INTEGER AS cnt
+    FROM public.thesis_supervisors
+    WHERE status = 'active'
+    GROUP BY lecturer_id
+  )
+  SELECT
+    p.id,
+    p.full_name,
+    p.title_prefix,
+    p.title_suffix,
+    p.role_code,
+    prog.name AS program_name,
+    p.research_field,
+    p.consultation_schedule,
+    COALESCE(p.max_supervisee_quota, 10)::INTEGER AS max_quota,
+    COALESCE(al.cnt, 0)::INTEGER AS active_count,
+    GREATEST(0, COALESCE(p.max_supervisee_quota, 10) - COALESCE(al.cnt, 0))::INTEGER AS available_quota,
+    (COALESCE(al.cnt, 0) < COALESCE(p.max_supervisee_quota, 10)) AS is_available
+  FROM public.profiles p
+  LEFT JOIN public.programs prog ON prog.id = p.program_id
+  LEFT JOIN active_loads al ON al.lecturer_id = p.id
+  WHERE p.role_code IN ('supervisor', 'examiner')
+    AND p.is_active = TRUE
+  ORDER BY
+    (COALESCE(al.cnt, 0) < COALESCE(p.max_supervisee_quota, 10)) DESC,
+    GREATEST(0, COALESCE(p.max_supervisee_quota, 10) - COALESCE(al.cnt, 0)) DESC,
+    p.full_name ASC;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.get_lecturer_quota_summary() TO authenticated;
+
 -- Exam Schedule Conflict Detection RPC
 CREATE OR REPLACE FUNCTION public.check_exam_schedule_conflicts(
   p_exam_date DATE,
@@ -1421,6 +1474,10 @@ CREATE POLICY "profiles_select_policy" ON public.profiles FOR SELECT USING (
     JOIN public.thesis_submissions t ON t.id = ea.thesis_id
     WHERE t.student_id = profiles.id AND ea.lecturer_id = auth.uid()
   )
+  OR EXISTS (
+    SELECT 1 FROM public.supervision_sessions ss
+    WHERE ss.student_id = profiles.id AND ss.lecturer_id = auth.uid()
+  )
 );
 
 DROP POLICY IF EXISTS "profiles_update_own" ON public.profiles;
@@ -1560,6 +1617,7 @@ DROP POLICY IF EXISTS "guidance_select" ON public.supervision_sessions;
 CREATE POLICY "guidance_select" ON public.supervision_sessions FOR SELECT USING (
   student_id = auth.uid()
   OR lecturer_id = auth.uid()
+  OR public.is_assigned_supervisor(thesis_id)
   OR public.is_program_admin()
 );
 
@@ -1570,7 +1628,10 @@ CREATE POLICY "guidance_insert" ON public.supervision_sessions FOR INSERT WITH C
 
 DROP POLICY IF EXISTS "guidance_update" ON public.supervision_sessions;
 CREATE POLICY "guidance_update" ON public.supervision_sessions FOR UPDATE USING (
-  student_id = auth.uid() OR lecturer_id = auth.uid() OR public.is_program_admin()
+  student_id = auth.uid()
+  OR lecturer_id = auth.uid()
+  OR public.is_assigned_supervisor(thesis_id)
+  OR public.is_program_admin()
 );
 
 -- Seminar Registrations RLS
