@@ -1,15 +1,18 @@
 import { useCallback, useEffect, useState } from 'react';
-import { AlertCircle, CheckCircle2, Eye, UserCog, XCircle } from 'lucide-react';
+import { AlertCircle, CheckCircle2, Eye, FileBadge2, RefreshCw, UserCog, XCircle } from 'lucide-react';
+import { DecreeIssuanceModal } from '../../components/admin/DecreeIssuanceModal';
 import { DataTable, type ColumnDef } from '../../components/ui/DataTable';
 import { DocumentViewerModal } from '../../components/ui/DocumentViewerModal';
 import { Modal } from '../../components/ui/Modal';
 import { StatusBadge } from '../../components/ui/StatusBadge';
 import { useAuth } from '../../contexts/AuthContext';
 import { useToast } from '../../contexts/ToastContext';
+import { ensureInitialDecreeIfEligible, issueOfficialDecree } from '../../lib/decreeService';
 import { logActivity, sendNotification, supabase } from '../../lib/supabase';
 import { DOCUMENT_CATEGORY_LABELS, formatDate, formatDateTime } from '../../lib/utils';
 import type {
   DocumentStatus,
+  OfficialDecree,
   Profile,
   SupervisionSession,
   ThesisDocument,
@@ -80,6 +83,15 @@ export function AdminSubmissionsPage() {
       entityId: active.id,
     });
     await logActivity(`admin_title_${status}`, 'thesis_submissions', active.id, { notes });
+
+    if (status === 'approved') {
+      await ensureInitialDecreeIfEligible({
+        thesisId: active.id,
+        decreeType: 'sk_pembimbing',
+        actorProfileId: profile.id,
+        isAdminAction: true,
+      });
+    }
 
     setActive(null);
     setNotes('');
@@ -268,19 +280,21 @@ export function SupervisorAssignmentPage() {
   const [theses, setTheses] = useState<ThesisSubmission[]>([]);
   const [lecturers, setLecturers] = useState<Profile[]>([]);
   const [assignments, setAssignments] = useState<ThesisSupervisor[]>([]);
+  const [decrees, setDecrees] = useState<OfficialDecree[]>([]);
   const [loads, setLoads] = useState<Record<string, number>>({});
 
   const [targetThesis, setTargetThesis] = useState<ThesisSubmission | null>(null);
   const [sup1, setSup1] = useState('');
   const [sup2, setSup2] = useState('');
   const [saving, setSaving] = useState(false);
+  const [decreeModalThesis, setDecreeModalThesis] = useState<ThesisSubmission | null>(null);
 
   const loadData = useCallback(async () => {
     setLoading(true);
-    const [{ data: tData }, { data: lData }, { data: aData }] = await Promise.all([
+    const [{ data: tData }, { data: lData }, { data: aData }, { data: dData }] = await Promise.all([
       supabase
         .from('thesis_submissions')
-        .select('*, student:profiles!thesis_submissions_student_id_fkey(*)')
+        .select('*, student:profiles!thesis_submissions_student_id_fkey(*, program:programs(*, department:departments(*)), department:departments(*)), program:programs(*, department:departments(*))')
         .eq('status', 'approved')
         .order('created_at', { ascending: false }),
       supabase
@@ -293,6 +307,11 @@ export function SupervisorAssignmentPage() {
         .from('thesis_supervisors')
         .select('*, lecturer:profiles!thesis_supervisors_lecturer_id_fkey(*)')
         .eq('status', 'active'),
+      supabase
+        .from('official_decrees')
+        .select('*')
+        .eq('decree_type', 'sk_pembimbing')
+        .order('version_number', { ascending: false }),
     ]);
 
     const loadMap: Record<string, number> = {};
@@ -303,6 +322,7 @@ export function SupervisorAssignmentPage() {
     setTheses((tData || []) as ThesisSubmission[]);
     setLecturers((lData || []) as Profile[]);
     setAssignments((aData || []) as ThesisSupervisor[]);
+    setDecrees((dData || []) as OfficialDecree[]);
     setLoads(loadMap);
     setLoading(false);
   }, []);
@@ -339,6 +359,9 @@ export function SupervisorAssignmentPage() {
       }
     }
 
+    const existingDecreeList = decrees.filter((d) => d.thesis_id === targetThesis.id);
+    const hadPreviousDecree = existingDecreeList.length > 0;
+
     setSaving(true);
     await supabase.from('thesis_supervisors').delete().eq('thesis_id', targetThesis.id);
 
@@ -362,8 +385,8 @@ export function SupervisorAssignmentPage() {
     }
 
     const { error } = await supabase.from('thesis_supervisors').insert(inserts);
-    setSaving(false);
     if (error) {
+      setSaving(false);
       showToast('Gagal menetapkan pembimbing', 'error', error.message);
       return;
     }
@@ -392,9 +415,34 @@ export function SupervisorAssignmentPage() {
     }
     await logActivity('assign_supervisors', 'thesis_supervisors', targetThesis.id, { sup1, sup2 });
 
+    const savedThesis = targetThesis;
     setTargetThesis(null);
-    showToast('Dosen pembimbing berhasil ditetapkan', 'success');
-    loadData();
+
+    if (!hadPreviousDecree) {
+      const { error: decreeErr } = await issueOfficialDecree({
+        thesisId: savedThesis.id,
+        decreeType: 'sk_pembimbing',
+        actorProfileId: profile.id,
+        isAdminAction: true,
+        notifyStudent: true,
+      });
+      setSaving(false);
+      if (decreeErr) {
+        showToast('Pembimbing disimpan, namun penerbitan SK gagal', 'warning', decreeErr);
+      } else {
+        showToast('Dosen pembimbing ditetapkan & SK Pembimbing (v1) otomatis diterbitkan', 'success');
+      }
+      await loadData();
+    } else {
+      setSaving(false);
+      showToast(
+        'Dosen pembimbing diperbarui',
+        'info',
+        'Silakan terbitkan ulang SK Pembimbing agar versi PDF terbaru tersimpan.'
+      );
+      await loadData();
+      setDecreeModalThesis(savedThesis);
+    }
   };
 
   const columns: ColumnDef<ThesisSubmission>[] = [
@@ -432,19 +480,59 @@ export function SupervisorAssignmentPage() {
       },
     },
     {
+      key: 'decree',
+      header: 'SK Pembimbing',
+      render: (r) => {
+        const list = decrees.filter((d) => d.thesis_id === r.id);
+        const latest = list.find((d) => d.is_latest) || list[0];
+        if (!latest) {
+          return <span className="text-[11px] text-slate-400">Belum Diterbitkan</span>;
+        }
+        return (
+          <div className="space-y-0.5">
+            <p className="font-mono text-[11px] font-medium text-emerald-700 dark:text-emerald-400">
+              v{latest.version_number} · {latest.letter_number}
+            </p>
+            {latest.needs_reissue && (
+              <p className="text-[10px] font-medium text-amber-700 dark:text-amber-400 flex items-center gap-1">
+                <RefreshCw className="w-3 h-3" />
+                Perlu Terbit Ulang
+              </p>
+            )}
+          </div>
+        );
+      },
+    },
+    {
       key: 'actions',
       header: 'Aksi',
       align: 'right',
-      render: (r) => (
-        <button
-          type="button"
-          onClick={() => openAssign(r)}
-          className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md bg-blue-700 hover:bg-blue-800 text-white"
-        >
-          <UserCog className="w-3.5 h-3.5" />
-          Tetapkan
-        </button>
-      ),
+      render: (r) => {
+        const hasSups = assignments.some((a) => a.thesis_id === r.id);
+        const latest = decrees.find((d) => d.thesis_id === r.id && d.is_latest);
+        return (
+          <div className="inline-flex items-center gap-1.5">
+            {hasSups && (
+              <button
+                type="button"
+                onClick={() => setDecreeModalThesis(r)}
+                className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium rounded-md border border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800"
+              >
+                <FileBadge2 className="w-3.5 h-3.5 text-blue-600" />
+                {latest?.needs_reissue ? 'Terbitkan Ulang SK' : latest ? 'Kelola SK' : 'Terbitkan SK'}
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => openAssign(r)}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md bg-blue-700 hover:bg-blue-800 text-white"
+            >
+              <UserCog className="w-3.5 h-3.5" />
+              Tetapkan
+            </button>
+          </div>
+        );
+      },
     },
   ];
 
@@ -453,7 +541,7 @@ export function SupervisorAssignmentPage() {
       <div>
         <h1 className="text-xl font-bold tracking-tight">Penetapan Dosen Pembimbing</h1>
         <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-          Tentukan Pembimbing 1 dan Pembimbing 2 dengan memantau beban bimbingan terhadap kuota masing-masing dosen.
+          Tentukan Pembimbing 1 dan Pembimbing 2, pantau beban bimbingan, serta kelola penerbitan SK Pembimbing resmi.
         </p>
       </div>
 
@@ -528,6 +616,15 @@ export function SupervisorAssignmentPage() {
           </div>
         </div>
       </Modal>
+
+      <DecreeIssuanceModal
+        open={Boolean(decreeModalThesis)}
+        onClose={() => setDecreeModalThesis(null)}
+        thesis={decreeModalThesis}
+        decreeType="sk_pembimbing"
+        existingDecrees={decreeModalThesis ? decrees.filter((d) => d.thesis_id === decreeModalThesis.id) : []}
+        onIssued={loadData}
+      />
     </div>
   );
 }

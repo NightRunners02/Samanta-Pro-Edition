@@ -511,3 +511,57 @@ export interface LecturerQuotaSummary {
   available_quota: number;
   is_available: boolean;
 }
+
+export type DecreeType = 'sk_pembimbing' | 'sk_penguji';
+
+export interface DecreePersonSnapshot {
+  lecturer_id: string;
+  full_name: string;
+  nim_nip: string | null;
+  role_label: string;
+  position: string | null;
+  research_field: string | null;
+}
+
+export interface OfficialDecreeSnapshot {
+  student_name: string;
+  student_nim: string;
+  thesis_title: string;
+  period_name: string;
+  academic_year: string;
+  faculty_code?: string;
+  program_degree?: string;
+  supervisors?: DecreePersonSnapshot[];
+  examiners?: DecreePersonSnapshot[];
+  exam_date?: string | null;
+  exam_time?: string | null;
+  room_name?: string | null;
+}
+
+export interface OfficialDecree {
+  id: string;
+  thesis_id: string;
+  student_id: string;
+  decree_type: DecreeType;
+  letter_number: string;
+  issued_date: string;
+  issued_by: string | null;
+  issuer_name: string;
+  issuer_title: string;
+  issuer_nip: string | null;
+  institution_name: string;
+  faculty_name: string;
+  program_name: string;
+  version_number: number;
+  is_latest: boolean;
+  needs_reissue: boolean;
+  assignment_hash: string | null;
+  snapshot_data: OfficialDecreeSnapshot;
+  bucket_name: string;
+  file_path: string;
+  file_name: string;
+  file_size: number;
+  created_at: string;
+  updated_at: string;
+}
+

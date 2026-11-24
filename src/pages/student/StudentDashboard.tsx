@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertCircle,
   ArrowRight,
@@ -20,18 +20,27 @@ import {
   XAxis,
   YAxis,
 } from 'recharts';
+import { SupportingDecreesSection } from '../../components/student/SupportingDecreesSection';
 import { CardGridSkeleton } from '../../components/ui/Skeleton';
 import { StatusBadge } from '../../components/ui/StatusBadge';
 import { useAuth } from '../../contexts/AuthContext';
+import {
+  ensureInitialDecreeIfEligible,
+  isExaminerDecreeEligible,
+  isSupervisorDecreeEligible,
+} from '../../lib/decreeService';
 import { supabase } from '../../lib/supabase';
 import { cn, formatDate, formatDateTime } from '../../lib/utils';
 import type {
   ActivityLog,
   AppNotification,
+  DecreeType,
   DefenseRegistration,
   ExamSchedule,
   ExamScore,
+  ExaminerAssignment,
   GraduationRecord,
+  OfficialDecree,
   PlagiarismCheck,
   SeminarRegistration,
   SupervisionSession,
@@ -66,6 +75,10 @@ export function StudentDashboard({ onNavigate }: StudentDashboardProps) {
   const [scores, setScores] = useState<ExamScore[]>([]);
   const [plagiarism, setPlagiarism] = useState<PlagiarismCheck | null>(null);
   const [graduation, setGraduation] = useState<GraduationRecord | null>(null);
+  const [decrees, setDecrees] = useState<OfficialDecree[]>([]);
+  const [defenseExaminers, setDefenseExaminers] = useState<ExaminerAssignment[]>([]);
+  const [generatingDecreeType, setGeneratingDecreeType] = useState<DecreeType | null>(null);
+  const bootstrappedRef = useRef<Record<string, boolean>>({});
   const [notifications, setNotifications] = useState<AppNotification[]>([]);
   const [activities, setActivities] = useState<ActivityLog[]>([]);
 
@@ -121,6 +134,8 @@ export function StudentDashboard({ onNavigate }: StudentDashboardProps) {
         { data: scoreData },
         { data: plagData },
         { data: gradData },
+        { data: decreeData },
+        { data: examinerData },
       ] = await Promise.all([
         supabase
           .from('thesis_supervisors')
@@ -166,6 +181,15 @@ export function StudentDashboard({ onNavigate }: StudentDashboardProps) {
           .order('created_at', { ascending: false })
           .limit(1)
           .maybeSingle(),
+        supabase
+          .from('official_decrees')
+          .select('*')
+          .eq('thesis_id', currentThesis.id)
+          .order('version_number', { ascending: false }),
+        supabase
+          .from('examiner_assignments')
+          .select('*')
+          .eq('thesis_id', currentThesis.id),
       ]);
 
       setSupervisors((supData || []) as ThesisSupervisor[]);
@@ -176,6 +200,11 @@ export function StudentDashboard({ onNavigate }: StudentDashboardProps) {
       setScores((scoreData || []) as ExamScore[]);
       setPlagiarism((plagData as PlagiarismCheck) || null);
       setGraduation((gradData as GraduationRecord) || null);
+      setDecrees((decreeData || []) as OfficialDecree[]);
+      setDefenseExaminers((examinerData || []) as ExaminerAssignment[]);
+    } else {
+      setDecrees([]);
+      setDefenseExaminers([]);
     }
 
     setLoading(false);
@@ -188,9 +217,17 @@ export function StudentDashboard({ onNavigate }: StudentDashboardProps) {
     const channel = supabase
       .channel(`student_dashboard_${profile.id}`)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'thesis_submissions', filter: `student_id=eq.${profile.id}` }, loadAll)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'thesis_supervisors', filter: `student_id=eq.${profile.id}` }, loadAll)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'thesis_progress', filter: `student_id=eq.${profile.id}` }, loadAll)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'supervision_sessions', filter: `student_id=eq.${profile.id}` }, loadAll)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'exam_schedules', filter: `student_id=eq.${profile.id}` }, loadAll)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'examiner_assignments' }, loadAll)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'seminar_registrations', filter: `student_id=eq.${profile.id}` }, loadAll)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'defense_registrations', filter: `student_id=eq.${profile.id}` }, loadAll)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'exam_scores' }, loadAll)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'plagiarism_checks', filter: `student_id=eq.${profile.id}` }, loadAll)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'graduation_records', filter: `student_id=eq.${profile.id}` }, loadAll)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'official_decrees', filter: `student_id=eq.${profile.id}` }, loadAll)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'notifications', filter: `user_id=eq.${profile.id}` }, loadAll)
       .subscribe();
 
@@ -198,6 +235,72 @@ export function StudentDashboard({ onNavigate }: StudentDashboardProps) {
       supabase.removeChannel(channel);
     };
   }, [loadAll, profile?.id]);
+
+  const latestDefenseSchedule = useMemo(
+    () =>
+      [...schedules]
+        .reverse()
+        .find((s) => s.exam_type === 'defense' && s.status !== 'cancelled') || null,
+    [schedules]
+  );
+
+  const supervisorDecreeEligible = useMemo(
+    () => isSupervisorDecreeEligible(thesis, supervisors),
+    [thesis, supervisors]
+  );
+
+  const examinerDecreeEligible = useMemo(
+    () => isExaminerDecreeEligible(thesis, defense, latestDefenseSchedule, defenseExaminers),
+    [thesis, defense, latestDefenseSchedule, defenseExaminers]
+  );
+
+  // Automatically generate & archive initial v1 PDF when workflow requirements are satisfied
+  useEffect(() => {
+    if (loading || !thesis) return;
+
+    const hasSupDecree = decrees.some((d) => d.decree_type === 'sk_pembimbing');
+    const hasExDecree = decrees.some((d) => d.decree_type === 'sk_penguji');
+
+    const runBootstrap = async () => {
+      if (supervisorDecreeEligible && !hasSupDecree) {
+        const key = `${thesis.id}:sk_pembimbing`;
+        if (!bootstrappedRef.current[key]) {
+          bootstrappedRef.current[key] = true;
+          setGeneratingDecreeType('sk_pembimbing');
+          const created = await ensureInitialDecreeIfEligible({
+            thesisId: thesis.id,
+            decreeType: 'sk_pembimbing',
+            actorProfileId: profile?.id || null,
+            isAdminAction: false,
+          });
+          setGeneratingDecreeType(null);
+          if (created) {
+            setDecrees((prev) => [created, ...prev.filter((d) => d.id !== created.id)]);
+          }
+        }
+      }
+
+      if (examinerDecreeEligible && !hasExDecree) {
+        const key = `${thesis.id}:sk_penguji`;
+        if (!bootstrappedRef.current[key]) {
+          bootstrappedRef.current[key] = true;
+          setGeneratingDecreeType('sk_penguji');
+          const created = await ensureInitialDecreeIfEligible({
+            thesisId: thesis.id,
+            decreeType: 'sk_penguji',
+            actorProfileId: profile?.id || null,
+            isAdminAction: false,
+          });
+          setGeneratingDecreeType(null);
+          if (created) {
+            setDecrees((prev) => [created, ...prev.filter((d) => d.id !== created.id)]);
+          }
+        }
+      }
+    };
+
+    runBootstrap();
+  }, [loading, thesis, decrees, supervisorDecreeEligible, examinerDecreeEligible, profile?.id]);
 
   const approvedChaptersCount = chapters.filter((c) => c.status === 'approved').length;
   const pendingRevisionsCount = chapters.filter((c) => c.status === 'needs_revision').length;
@@ -529,6 +632,14 @@ export function StudentDashboard({ onNavigate }: StudentDashboardProps) {
           </p>
         </div>
       </div>
+
+      {/* Berkas Pendukung (SK Pembimbing & SK Penguji) */}
+      <SupportingDecreesSection
+        decrees={decrees}
+        supervisorEligible={supervisorDecreeEligible}
+        examinerEligible={examinerDecreeEligible}
+        generatingType={generatingDecreeType}
+      />
 
       {/* Chart + Recent Notifications & Activity */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">

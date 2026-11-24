@@ -1,10 +1,12 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { AlertTriangle, CalendarPlus, Loader2, Trash2 } from 'lucide-react';
+import { AlertTriangle, CalendarPlus, FileBadge2, Loader2, RefreshCw, Trash2 } from 'lucide-react';
+import { DecreeIssuanceModal } from '../../components/admin/DecreeIssuanceModal';
 import { DataTable, type ColumnDef } from '../../components/ui/DataTable';
 import { Modal } from '../../components/ui/Modal';
 import { StatusBadge } from '../../components/ui/StatusBadge';
 import { useAuth } from '../../contexts/AuthContext';
 import { useToast } from '../../contexts/ToastContext';
+import { ensureInitialDecreeIfEligible, issueOfficialDecree } from '../../lib/decreeService';
 import { logActivity, sendNotification, supabase } from '../../lib/supabase';
 import { formatDate } from '../../lib/utils';
 import type {
@@ -12,6 +14,7 @@ import type {
   ExamRegistrationStatus,
   ExamSchedule,
   ExaminerAssignment,
+  OfficialDecree,
   Profile,
   SeminarRegistration,
   ThesisSubmission,
@@ -188,6 +191,16 @@ export function AdminDefensePage() {
       category: 'defense',
     });
     await logActivity(`defense_${status}`, 'defense_registrations', active.id, {});
+
+    if (status === 'approved') {
+      await ensureInitialDecreeIfEligible({
+        thesisId: active.thesis_id,
+        decreeType: 'sk_penguji',
+        actorProfileId: profile.id,
+        isAdminAction: true,
+      });
+    }
+
     setActive(null);
     setNotes('');
     showToast('Status pendaftaran sidang diperbarui', 'success');
@@ -283,6 +296,8 @@ export function ExamSchedulingPage() {
   const [schedules, setSchedules] = useState<ExamSchedule[]>([]);
   const [theses, setTheses] = useState<ThesisSubmission[]>([]);
   const [lecturers, setLecturers] = useState<Profile[]>([]);
+  const [defenseRegs, setDefenseRegs] = useState<DefenseRegistration[]>([]);
+  const [decrees, setDecrees] = useState<OfficialDecree[]>([]);
 
   const [modalOpen, setModalOpen] = useState(false);
   const [editing, setEditing] = useState<ExamSchedule | null>(null);
@@ -297,28 +312,43 @@ export function ExamSchedulingPage() {
   const [examiner2Id, setExaminer2Id] = useState('');
   const [conflicts, setConflicts] = useState<Array<{ conflict_type: string; conflict_detail: string }>>([]);
   const [saving, setSaving] = useState(false);
+  const [decreeModalThesis, setDecreeModalThesis] = useState<ThesisSubmission | null>(null);
 
   const loadData = useCallback(async () => {
     setLoading(true);
-    const [{ data: schedData }, { data: thData }, { data: lecData }] = await Promise.all([
-      supabase
-        .from('exam_schedules')
-        .select('*, student:profiles!exam_schedules_student_id_fkey(*), thesis:thesis_submissions(*), examiners:examiner_assignments(*, lecturer:profiles!examiner_assignments_lecturer_id_fkey(*))')
-        .order('exam_date', { ascending: true }),
-      supabase
-        .from('thesis_submissions')
-        .select('*, student:profiles!thesis_submissions_student_id_fkey(*)')
-        .eq('status', 'approved'),
-      supabase
-        .from('profiles')
-        .select('*')
-        .in('role_code', ['supervisor', 'examiner'])
-        .eq('is_active', true)
-        .order('full_name'),
-    ]);
+    const [{ data: schedData }, { data: thData }, { data: lecData }, { data: defData }, { data: decData }] =
+      await Promise.all([
+        supabase
+          .from('exam_schedules')
+          .select(
+            '*, student:profiles!exam_schedules_student_id_fkey(*), thesis:thesis_submissions(*), examiners:examiner_assignments(*, lecturer:profiles!examiner_assignments_lecturer_id_fkey(*))'
+          )
+          .order('exam_date', { ascending: true }),
+        supabase
+          .from('thesis_submissions')
+          .select('*, student:profiles!thesis_submissions_student_id_fkey(*, program:programs(*, department:departments(*)), department:departments(*)), program:programs(*, department:departments(*))')
+          .eq('status', 'approved'),
+        supabase
+          .from('profiles')
+          .select('*')
+          .in('role_code', ['supervisor', 'examiner'])
+          .eq('is_active', true)
+          .order('full_name'),
+        supabase
+          .from('defense_registrations')
+          .select('*')
+          .order('created_at', { ascending: false }),
+        supabase
+          .from('official_decrees')
+          .select('*')
+          .eq('decree_type', 'sk_penguji')
+          .order('version_number', { ascending: false }),
+      ]);
     setSchedules((schedData || []) as ExamSchedule[]);
     setTheses((thData || []) as ThesisSubmission[]);
     setLecturers((lecData || []) as Profile[]);
+    setDefenseRegs((defData || []) as DefenseRegistration[]);
+    setDecrees((decData || []) as OfficialDecree[]);
     setLoading(false);
   }, []);
 
@@ -414,9 +444,50 @@ export function ExamSchedulingPage() {
       exam_date: examDate,
     });
 
-    setSaving(false);
+    const hadPreviousDefenseDecree = decrees.some((d) => d.thesis_id === selectedThesis.id);
+    const defReg = defenseRegs.find((d) => d.thesis_id === selectedThesis.id) || null;
+    const isDefApproved = !defReg || ['approved', 'scheduled', 'completed'].includes(defReg.status);
+
     setModalOpen(false);
     setEditing(null);
+
+    if (examType === 'defense' && examinerRows.length > 0 && isDefApproved) {
+      if (!hadPreviousDefenseDecree) {
+        const { error: decErr } = await issueOfficialDecree({
+          thesisId: selectedThesis.id,
+          decreeType: 'sk_penguji',
+          actorProfileId: profile.id,
+          isAdminAction: true,
+          notifyStudent: true,
+        });
+        setSaving(false);
+        if (decErr) {
+          showToast('Jadwal disimpan, namun penerbitan SK Penguji gagal', 'warning', decErr);
+        } else {
+          showToast('Jadwal sidang disimpan & SK Penguji (v1) otomatis diterbitkan', 'success');
+        }
+        await loadData();
+        return;
+      } else {
+        await supabase
+          .from('official_decrees')
+          .update({ needs_reissue: true })
+          .eq('thesis_id', selectedThesis.id)
+          .eq('decree_type', 'sk_penguji')
+          .eq('is_latest', true);
+        setSaving(false);
+        showToast(
+          'Jadwal & penguji diperbarui',
+          'info',
+          'Silakan terbitkan ulang SK Penguji agar dokumen resmi terbaru tersimpan.'
+        );
+        await loadData();
+        setDecreeModalThesis(selectedThesis);
+        return;
+      }
+    }
+
+    setSaving(false);
     showToast('Jadwal ujian disimpan & notifikasi terkirim', 'success');
     loadData();
   };
@@ -479,39 +550,54 @@ export function ExamSchedulingPage() {
       key: 'actions',
       header: 'Aksi',
       align: 'right',
-      render: (r) => (
-        <div className="inline-flex items-center gap-1.5">
-          <button
-            type="button"
-            onClick={() => {
-              setEditing(r);
-              setThesisId(r.thesis_id);
-              setExamType(r.exam_type);
-              setExamDate(r.exam_date);
-              setStartTime(r.start_time.slice(0, 5));
-              setEndTime(r.end_time.slice(0, 5));
-              setRoomName(r.room_name);
-              const ch = r.examiners?.find((e) => e.examiner_role === 'chair');
-              const e1 = r.examiners?.find((e) => e.examiner_role === 'examiner_1');
-              const e2 = r.examiners?.find((e) => e.examiner_role === 'examiner_2');
-              setChairId(ch?.lecturer_id || '');
-              setExaminer1Id(e1?.lecturer_id || '');
-              setExaminer2Id(e2?.lecturer_id || '');
-              setModalOpen(true);
-            }}
-            className="px-2.5 py-1.5 text-xs rounded-md border border-slate-200 dark:border-slate-700"
-          >
-            Ubah
-          </button>
-          <button
-            type="button"
-            onClick={() => handleDelete(r.id)}
-            className="p-1.5 rounded-md text-rose-600 hover:bg-rose-50 dark:hover:bg-rose-950/30"
-          >
-            <Trash2 className="w-3.5 h-3.5" />
-          </button>
-        </div>
-      ),
+      render: (r) => {
+        const th = theses.find((t) => t.id === r.thesis_id) || r.thesis || null;
+        const latestSk = decrees.find((d) => d.thesis_id === r.thesis_id && d.is_latest);
+        const canIssueSk = r.exam_type === 'defense' && (r.examiners?.length || 0) > 0 && Boolean(th);
+        return (
+          <div className="inline-flex items-center gap-1.5">
+            {canIssueSk && th && (
+              <button
+                type="button"
+                onClick={() => setDecreeModalThesis(th)}
+                className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium rounded-md border border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800"
+              >
+                <FileBadge2 className="w-3.5 h-3.5 text-blue-600" />
+                {latestSk?.needs_reissue ? 'Terbitkan Ulang SK' : latestSk ? `SK v${latestSk.version_number}` : 'Terbitkan SK'}
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => {
+                setEditing(r);
+                setThesisId(r.thesis_id);
+                setExamType(r.exam_type);
+                setExamDate(r.exam_date);
+                setStartTime(r.start_time.slice(0, 5));
+                setEndTime(r.end_time.slice(0, 5));
+                setRoomName(r.room_name);
+                const ch = r.examiners?.find((e) => e.examiner_role === 'chair');
+                const e1 = r.examiners?.find((e) => e.examiner_role === 'examiner_1');
+                const e2 = r.examiners?.find((e) => e.examiner_role === 'examiner_2');
+                setChairId(ch?.lecturer_id || '');
+                setExaminer1Id(e1?.lecturer_id || '');
+                setExaminer2Id(e2?.lecturer_id || '');
+                setModalOpen(true);
+              }}
+              className="px-2.5 py-1.5 text-xs rounded-md border border-slate-200 dark:border-slate-700"
+            >
+              Ubah
+            </button>
+            <button
+              type="button"
+              onClick={() => handleDelete(r.id)}
+              className="p-1.5 rounded-md text-rose-600 hover:bg-rose-50 dark:hover:bg-rose-950/30"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        );
+      },
     },
   ];
 
@@ -700,6 +786,15 @@ export function ExamSchedulingPage() {
           </div>
         </form>
       </Modal>
+
+      <DecreeIssuanceModal
+        open={Boolean(decreeModalThesis)}
+        onClose={() => setDecreeModalThesis(null)}
+        thesis={decreeModalThesis}
+        decreeType="sk_penguji"
+        existingDecrees={decreeModalThesis ? decrees.filter((d) => d.thesis_id === decreeModalThesis.id) : []}
+        onIssued={loadData}
+      />
     </div>
   );
 }
@@ -710,19 +805,30 @@ export function ExamSchedulingPage() {
 export function ExaminerManagementPage() {
   const [loading, setLoading] = useState(true);
   const [assignments, setAssignments] = useState<Array<ExaminerAssignment & { schedule?: ExamSchedule; thesis?: ThesisSubmission & { student?: Profile } }>>([]);
+  const [decrees, setDecrees] = useState<OfficialDecree[]>([]);
+  const [decreeModalThesis, setDecreeModalThesis] = useState<ThesisSubmission | null>(null);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    const [{ data }, { data: decData }] = await Promise.all([
+      supabase
+        .from('examiner_assignments')
+        .select('*, lecturer:profiles!examiner_assignments_lecturer_id_fkey(*), schedule:exam_schedules(*), thesis:thesis_submissions(*, student:profiles!thesis_submissions_student_id_fkey(*, program:programs(*, department:departments(*)), department:departments(*)), program:programs(*, department:departments(*)))')
+        .order('created_at', { ascending: false }),
+      supabase
+        .from('official_decrees')
+        .select('*')
+        .eq('decree_type', 'sk_penguji')
+        .order('version_number', { ascending: false }),
+    ]);
+    setAssignments((data || []) as typeof assignments);
+    setDecrees((decData || []) as OfficialDecree[]);
+    setLoading(false);
+  }, []);
 
   useEffect(() => {
-    const load = async () => {
-      setLoading(true);
-      const { data } = await supabase
-        .from('examiner_assignments')
-        .select('*, lecturer:profiles!examiner_assignments_lecturer_id_fkey(*), schedule:exam_schedules(*), thesis:thesis_submissions(*, student:profiles!thesis_submissions_student_id_fkey(*))')
-        .order('created_at', { ascending: false });
-      setAssignments((data || []) as typeof assignments);
-      setLoading(false);
-    };
     load();
-  }, []);
+  }, [load]);
 
   const columns: ColumnDef<(typeof assignments)[number]>[] = [
     {
@@ -743,12 +849,61 @@ export function ExaminerManagementPage() {
     {
       key: 'date',
       header: 'Jadwal',
-      render: (r) => <span className="font-mono">{formatDate(r.schedule?.exam_date)}</span>,
+      render: (r) => (
+        <span className="font-mono">
+          {formatDate(r.schedule?.exam_date)} ({r.schedule?.exam_type === 'defense' ? 'Sidang' : 'Seminar'})
+        </span>
+      ),
     },
     {
       key: 'status',
       header: 'Status Persetujuan',
       render: (r) => <StatusBadge status={r.approval_status} />,
+    },
+    {
+      key: 'decree',
+      header: 'SK Penguji',
+      render: (r) => {
+        if (r.schedule?.exam_type !== 'defense') {
+          return <span className="text-[11px] text-slate-400">Seminar</span>;
+        }
+        const latest = decrees.find((d) => d.thesis_id === r.thesis_id && d.is_latest);
+        if (!latest) {
+          return <span className="text-[11px] text-slate-400">Belum Diterbitkan</span>;
+        }
+        return (
+          <div className="space-y-0.5">
+            <span className="font-mono text-[11px] font-medium text-emerald-700 dark:text-emerald-400">
+              v{latest.version_number} · {latest.letter_number}
+            </span>
+            {latest.needs_reissue && (
+              <p className="text-[10px] text-amber-700 dark:text-amber-400 flex items-center gap-1">
+                <RefreshCw className="w-3 h-3" />
+                Perlu Terbit Ulang
+              </p>
+            )}
+          </div>
+        );
+      },
+    },
+    {
+      key: 'actions',
+      header: 'Aksi',
+      align: 'right',
+      render: (r) => {
+        if (r.schedule?.exam_type !== 'defense' || !r.thesis) return null;
+        const latest = decrees.find((d) => d.thesis_id === r.thesis_id && d.is_latest);
+        return (
+          <button
+            type="button"
+            onClick={() => setDecreeModalThesis(r.thesis || null)}
+            className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium rounded-md border border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800"
+          >
+            <FileBadge2 className="w-3.5 h-3.5 text-blue-600" />
+            {latest?.needs_reissue ? 'Terbitkan Ulang SK' : latest ? 'Kelola SK' : 'Terbitkan SK'}
+          </button>
+        );
+      },
     },
   ];
 
@@ -757,10 +912,18 @@ export function ExaminerManagementPage() {
       <div>
         <h1 className="text-xl font-bold tracking-tight">Examiner Management</h1>
         <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-          Rekap penugasan ketua dan anggota tim penguji seminar proposal serta sidang akhir.
+          Rekap penugasan ketua dan anggota tim penguji serta penerbitan SK Penguji Sidang Akhir.
         </p>
       </div>
       <DataTable data={assignments} columns={columns} keyField={(r) => r.id} loading={loading} />
+      <DecreeIssuanceModal
+        open={Boolean(decreeModalThesis)}
+        onClose={() => setDecreeModalThesis(null)}
+        thesis={decreeModalThesis}
+        decreeType="sk_penguji"
+        existingDecrees={decreeModalThesis ? decrees.filter((d) => d.thesis_id === decreeModalThesis.id) : []}
+        onIssued={load}
+      />
     </div>
   );
 }

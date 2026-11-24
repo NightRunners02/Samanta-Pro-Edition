@@ -1,7 +1,19 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { AlertCircle, FileSearch, Loader2, Send } from 'lucide-react';
+import {
+  AlertCircle,
+  ArrowRight,
+  CheckCircle2,
+  FileSearch,
+  Loader2,
+  Lock,
+  Send,
+} from 'lucide-react';
 import { EmptyState } from '../../components/ui/EmptyState';
 import { FileUploadField } from '../../components/ui/FileUploadField';
+import {
+  PostDefenseStepper,
+  isDefenseCompleted,
+} from '../../components/ui/PostDefenseStepper';
 import {
   RealtimeDocumentPreviewPanel,
   SavedDocumentCard,
@@ -12,9 +24,22 @@ import { useAuth } from '../../contexts/AuthContext';
 import { useToast } from '../../contexts/ToastContext';
 import { logActivity, supabase, uploadPrivateDocument } from '../../lib/supabase';
 import { formatDateTime } from '../../lib/utils';
-import type { PlagiarismCheck, Program, ThesisDocument, ThesisSubmission } from '../../types/database';
+import type {
+  DefenseRegistration,
+  ExamSchedule,
+  ExamScore,
+  GraduationRecord,
+  PlagiarismCheck,
+  Program,
+  ThesisDocument,
+  ThesisSubmission,
+} from '../../types/database';
 
-export function PlagiarismPage() {
+interface PlagiarismPageProps {
+  onNavigate?: (pageId: string) => void;
+}
+
+export function PlagiarismPage({ onNavigate }: PlagiarismPageProps) {
   const { profile, systemSettings } = useAuth();
   const { showToast } = useToast();
 
@@ -22,7 +47,12 @@ export function PlagiarismPage() {
   const [submitting, setSubmitting] = useState(false);
   const [thesis, setThesis] = useState<ThesisSubmission | null>(null);
   const [program, setProgram] = useState<Program | null>(null);
+  const [defenseSchedule, setDefenseSchedule] = useState<ExamSchedule | null>(null);
+  const [defenseRegistration, setDefenseRegistration] = useState<DefenseRegistration | null>(null);
+  const [scores, setScores] = useState<ExamScore[]>([]);
+  const [fullThesisDoc, setFullThesisDoc] = useState<ThesisDocument | null>(null);
   const [record, setRecord] = useState<PlagiarismCheck | null>(null);
+  const [graduation, setGraduation] = useState<GraduationRecord | null>(null);
   const [reportDoc, setReportDoc] = useState<ThesisDocument | null>(null);
   const [supportingDoc, setSupportingDoc] = useState<ThesisDocument | null>(null);
 
@@ -53,16 +83,61 @@ export function PlagiarismPage() {
       setProgram((pData as Program) || null);
 
       if (currentThesis) {
-        const { data: plagData } = await supabase
-          .from('plagiarism_checks')
-          .select('*')
-          .eq('thesis_id', currentThesis.id)
-          .order('created_at', { ascending: false })
-          .limit(1)
-          .maybeSingle();
+        const [
+          { data: plagData },
+          { data: schedData },
+          { data: defRegData },
+          { data: scoreData },
+          { data: fullDocData },
+          { data: gradData },
+        ] = await Promise.all([
+          supabase
+            .from('plagiarism_checks')
+            .select('*')
+            .eq('thesis_id', currentThesis.id)
+            .order('created_at', { ascending: false })
+            .limit(1)
+            .maybeSingle(),
+          supabase
+            .from('exam_schedules')
+            .select('*')
+            .eq('thesis_id', currentThesis.id)
+            .eq('exam_type', 'defense')
+            .order('created_at', { ascending: false })
+            .limit(1)
+            .maybeSingle(),
+          supabase
+            .from('defense_registrations')
+            .select('*')
+            .eq('thesis_id', currentThesis.id)
+            .order('created_at', { ascending: false })
+            .limit(1)
+            .maybeSingle(),
+          supabase.from('exam_scores').select('*').eq('thesis_id', currentThesis.id),
+          supabase
+            .from('thesis_documents')
+            .select('*')
+            .eq('thesis_id', currentThesis.id)
+            .eq('category', 'full_thesis')
+            .eq('is_latest', true)
+            .limit(1)
+            .maybeSingle(),
+          supabase
+            .from('graduation_records')
+            .select('*')
+            .eq('thesis_id', currentThesis.id)
+            .order('created_at', { ascending: false })
+            .limit(1)
+            .maybeSingle(),
+        ]);
 
         const currentRecord = (plagData as PlagiarismCheck) || null;
         setRecord(currentRecord);
+        setDefenseSchedule((schedData as ExamSchedule) || null);
+        setDefenseRegistration((defRegData as DefenseRegistration) || null);
+        setScores((scoreData || []) as ExamScore[]);
+        setFullThesisDoc((fullDocData as ThesisDocument) || null);
+        setGraduation((gradData as GraduationRecord) || null);
 
         const docIds = [currentRecord?.document_id, currentRecord?.supporting_document_id].filter(
           Boolean
@@ -87,6 +162,11 @@ export function PlagiarismPage() {
         }
       } else {
         setRecord(null);
+        setDefenseSchedule(null);
+        setDefenseRegistration(null);
+        setScores([]);
+        setFullThesisDoc(null);
+        setGraduation(null);
         setReportDoc(null);
         setSupportingDoc(null);
       }
@@ -100,7 +180,7 @@ export function PlagiarismPage() {
     loadData();
   }, [loadData]);
 
-  // Realtime sync for plagiarism verification status & uploaded documents
+  // Realtime sync for plagiarism verification, defense status, scores, documents, and yudisium
   useEffect(() => {
     if (!profile?.id) return;
     const channel = supabase
@@ -115,6 +195,21 @@ export function PlagiarismPage() {
         { event: '*', schema: 'public', table: 'thesis_documents', filter: `student_id=eq.${profile.id}` },
         () => loadData({ silent: true })
       )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'exam_schedules', filter: `student_id=eq.${profile.id}` },
+        () => loadData({ silent: true })
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'defense_registrations', filter: `student_id=eq.${profile.id}` },
+        () => loadData({ silent: true })
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'graduation_records', filter: `student_id=eq.${profile.id}` },
+        () => loadData({ silent: true })
+      )
       .subscribe();
 
     return () => {
@@ -123,7 +218,10 @@ export function PlagiarismPage() {
   }, [profile?.id, loadData]);
 
   const maxAllowed = program?.max_plagiarism_pct ?? systemSettings?.default_max_plagiarism_pct ?? 25;
-  const canSubmit = !record || ['not_submitted', 'revision_required', 'rejected'].includes(record.status);
+  const defenseEnded = isDefenseCompleted(defenseSchedule, defenseRegistration, scores);
+  const canSubmit =
+    defenseEnded &&
+    (!record || ['not_submitted', 'revision_required', 'rejected'].includes(record.status));
 
   const handleSelectReportFile = (file: File | null) => {
     setReportFile(file);
@@ -138,6 +236,14 @@ export function PlagiarismPage() {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!profile || !thesis) return;
+    if (!defenseEnded) {
+      showToast(
+        'Sidang akhir belum berakhir',
+        'warning',
+        'Hasil cek plagiasi hanya dapat diunggah setelah pelaksanaan Sidang Akhir berakhir.'
+      );
+      return;
+    }
     if (!reportFile && !record?.document_id) {
       showToast('Unggah berkas hasil cek plagiasi terlebih dahulu', 'warning');
       return;
@@ -232,13 +338,78 @@ export function PlagiarismPage() {
     <div className="space-y-6 max-w-7xl">
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
-          <h1 className="text-xl font-bold tracking-tight">Verifikasi Plagiasi (Berbasis Dokumen)</h1>
+          <h1 className="text-xl font-bold tracking-tight">Verifikasi Plagiasi (Pasca Sidang Akhir)</h1>
           <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-            Unggah hasil pemeriksaan kemiripan naskah untuk diverifikasi secara manual oleh Admin Program Studi. Batas maksimal prodi: <span className="font-mono font-semibold">{maxAllowed}%</span>.
+            Unggah hasil pemeriksaan kemiripan naskah final setelah sidang akhir berakhir sebagai syarat menuju Yudisium. Batas maksimal prodi:{' '}
+            <span className="font-mono font-semibold">{maxAllowed}%</span>.
           </p>
         </div>
         <StatusBadge status={record?.status || 'not_submitted'} />
       </div>
+
+      {/* Step-by-Step Post-Defense Progress up to Final Yudisium */}
+      <PostDefenseStepper
+        currentPage="plagiarism"
+        defenseSchedule={defenseSchedule}
+        defenseRegistration={defenseRegistration}
+        scores={scores}
+        fullThesisDoc={fullThesisDoc}
+        plagiarism={record}
+        graduation={graduation}
+        onNavigate={onNavigate}
+      />
+
+      {!defenseEnded && (
+        <div className="rounded-xl border border-amber-200 dark:border-amber-900/60 bg-amber-50/70 dark:bg-amber-950/20 p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
+          <div className="flex items-start gap-3">
+            <Lock className="w-4 h-4 text-amber-700 dark:text-amber-400 shrink-0 mt-0.5" />
+            <div>
+              <p className="font-semibold text-amber-900 dark:text-amber-200">
+                Unggah Hasil Cek Plagiasi Dibuka Setelah Sidang Akhir Berakhir
+              </p>
+              <p className="text-amber-800 dark:text-amber-300 mt-0.5">
+                Selesaikan pelaksanaan Sidang Akhir dan finalisasi penilaian terlebih dahulu sebelum mengunggah bukti cek plagiasi naskah final.
+              </p>
+            </div>
+          </div>
+          {onNavigate && (
+            <button
+              type="button"
+              onClick={() => onNavigate('defense')}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-amber-700 hover:bg-amber-800 text-white text-[11px] font-medium shrink-0"
+            >
+              <span>Lihat Status Sidang</span>
+              <ArrowRight className="w-3.5 h-3.5" />
+            </button>
+          )}
+        </div>
+      )}
+
+      {record?.status === 'approved' && (
+        <div className="rounded-xl border border-emerald-200 dark:border-emerald-900/60 bg-emerald-50/70 dark:bg-emerald-950/20 p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
+          <div className="flex items-start gap-3">
+            <CheckCircle2 className="w-4 h-4 text-emerald-700 dark:text-emerald-400 shrink-0 mt-0.5" />
+            <div>
+              <p className="font-semibold text-emerald-900 dark:text-emerald-200">
+                Verifikasi Plagiasi Disetujui ({record.similarity_percent ?? 0}%)
+              </p>
+              <p className="text-emerald-800 dark:text-emerald-300 mt-0.5">
+                Anda telah memenuhi syarat plagiasi. Lanjutkan ke step berikutnya untuk mengajukan berkas Yudisium hingga kelulusan resmi.
+              </p>
+            </div>
+          </div>
+          {onNavigate && (
+            <button
+              type="button"
+              onClick={() => onNavigate('yudisium')}
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-medium shrink-0"
+            >
+              <span>Lanjut ke Pengajuan Yudisium</span>
+              <ArrowRight className="w-3.5 h-3.5" />
+            </button>
+          )}
+        </div>
+      )}
 
       {record && (
         <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-5 space-y-3 text-xs">
@@ -337,7 +508,13 @@ export function PlagiarismPage() {
             />
           )}
 
-          {!canSubmit && (
+          {!defenseEnded && !record && (
+            <p className="text-[11px] text-slate-500 dark:text-slate-400 rounded-lg bg-slate-50 dark:bg-slate-950/60 border border-slate-200 dark:border-slate-800 px-3 py-2">
+              Formulir unggah akan aktif otomatis setelah Sidang Akhir Anda dinyatakan selesai.
+            </p>
+          )}
+
+          {defenseEnded && !canSubmit && (
             <p className="text-[11px] text-slate-500 dark:text-slate-400 rounded-lg bg-slate-50 dark:bg-slate-950/60 border border-slate-200 dark:border-slate-800 px-3 py-2">
               Dokumen plagiasi Anda tetap tersimpan aman dan dapat dipratinjau atau diunduh ulang melalui panel di sebelah kanan.
             </p>

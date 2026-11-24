@@ -523,6 +523,38 @@ ALTER TABLE public.system_settings
   ADD COLUMN IF NOT EXISTS logo_url TEXT,
   ADD COLUMN IF NOT EXISTS favicon_url TEXT;
 
+-- 23. official_decrees (SK Pembimbing & SK Penguji with Version History)
+CREATE TABLE IF NOT EXISTS public.official_decrees (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  thesis_id UUID NOT NULL REFERENCES public.thesis_submissions(id) ON DELETE CASCADE,
+  student_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+  decree_type TEXT NOT NULL CHECK (decree_type IN ('sk_pembimbing', 'sk_penguji')),
+  letter_number TEXT NOT NULL,
+  issued_date DATE NOT NULL DEFAULT CURRENT_DATE,
+  issued_by UUID REFERENCES public.profiles(id) ON DELETE SET NULL,
+  issuer_name TEXT NOT NULL,
+  issuer_title TEXT NOT NULL,
+  issuer_nip TEXT,
+  institution_name TEXT NOT NULL,
+  faculty_name TEXT NOT NULL,
+  program_name TEXT NOT NULL,
+  version_number INTEGER NOT NULL DEFAULT 1 CHECK (version_number >= 1),
+  is_latest BOOLEAN NOT NULL DEFAULT TRUE,
+  needs_reissue BOOLEAN NOT NULL DEFAULT FALSE,
+  assignment_hash TEXT,
+  snapshot_data JSONB NOT NULL DEFAULT '{}'::jsonb,
+  bucket_name TEXT NOT NULL DEFAULT 'official-decrees',
+  file_path TEXT NOT NULL,
+  file_name TEXT NOT NULL,
+  file_size BIGINT NOT NULL DEFAULT 0,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (thesis_id, decree_type, version_number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_official_decrees_student ON public.official_decrees(student_id, decree_type, is_latest);
+CREATE INDEX IF NOT EXISTS idx_official_decrees_thesis ON public.official_decrees(thesis_id, decree_type, version_number DESC);
+
 -- Attach updated_at triggers
 DO $$
 DECLARE
@@ -532,7 +564,7 @@ BEGIN
     'departments', 'programs', 'academic_periods', 'profiles', 'submission_requirements',
     'thesis_submissions', 'thesis_documents', 'thesis_progress', 'supervision_sessions',
     'seminar_registrations', 'defense_registrations', 'exam_schedules', 'exam_scores',
-    'plagiarism_checks', 'graduation_records', 'system_settings'
+    'plagiarism_checks', 'graduation_records', 'system_settings', 'official_decrees'
   ]
   LOOP
     EXECUTE format('DROP TRIGGER IF EXISTS trg_%I_updated_at ON public.%I;', tbl, tbl);
@@ -621,6 +653,55 @@ AS $$
     WHERE thesis_id = p_thesis_id
       AND lecturer_id = auth.uid()
   );
+$$;
+
+CREATE OR REPLACE FUNCTION public.can_student_bootstrap_decree(p_thesis_id UUID, p_decree_type TEXT)
+RETURNS BOOLEAN
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  SELECT CASE
+    WHEN p_decree_type = 'sk_pembimbing' THEN (
+      EXISTS (
+        SELECT 1 FROM public.thesis_submissions t
+        WHERE t.id = p_thesis_id
+          AND t.student_id = auth.uid()
+          AND t.status = 'approved'
+      )
+      AND EXISTS (
+        SELECT 1 FROM public.thesis_supervisors ts
+        WHERE ts.thesis_id = p_thesis_id
+          AND ts.status = 'active'
+      )
+    )
+    WHEN p_decree_type = 'sk_penguji' THEN (
+      EXISTS (
+        SELECT 1 FROM public.thesis_submissions t
+        WHERE t.id = p_thesis_id
+          AND t.student_id = auth.uid()
+          AND t.status = 'approved'
+      )
+      AND EXISTS (
+        SELECT 1
+        FROM public.exam_schedules es
+        JOIN public.examiner_assignments ea ON ea.schedule_id = es.id
+        WHERE es.thesis_id = p_thesis_id
+          AND es.exam_type = 'defense'
+          AND es.status <> 'cancelled'
+      )
+      AND (
+        NOT EXISTS (SELECT 1 FROM public.defense_registrations dr WHERE dr.thesis_id = p_thesis_id)
+        OR EXISTS (
+          SELECT 1 FROM public.defense_registrations dr
+          WHERE dr.thesis_id = p_thesis_id
+            AND dr.status IN ('approved', 'scheduled', 'completed')
+        )
+      )
+    )
+    ELSE FALSE
+  END;
 $$;
 
 -- ============================================================================
@@ -747,6 +828,60 @@ DROP TRIGGER IF EXISTS trg_supervisor_assigned ON public.thesis_supervisors;
 CREATE TRIGGER trg_supervisor_assigned
   AFTER INSERT ON public.thesis_supervisors
   FOR EACH ROW EXECUTE FUNCTION public.handle_supervisor_assigned();
+
+CREATE OR REPLACE FUNCTION public.handle_supervisor_changed_mark_reissue()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_thesis_id UUID := COALESCE(NEW.thesis_id, OLD.thesis_id);
+BEGIN
+  IF v_thesis_id IS NOT NULL THEN
+    UPDATE public.official_decrees
+    SET needs_reissue = TRUE
+    WHERE thesis_id = v_thesis_id
+      AND decree_type = 'sk_pembimbing'
+      AND is_latest = TRUE;
+  END IF;
+  RETURN COALESCE(NEW, OLD);
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_supervisors_mark_decree_reissue ON public.thesis_supervisors;
+CREATE TRIGGER trg_supervisors_mark_decree_reissue
+  AFTER INSERT OR UPDATE OR DELETE ON public.thesis_supervisors
+  FOR EACH ROW EXECUTE FUNCTION public.handle_supervisor_changed_mark_reissue();
+
+CREATE OR REPLACE FUNCTION public.handle_examiner_changed_mark_reissue()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_thesis_id UUID := COALESCE(NEW.thesis_id, OLD.thesis_id);
+  v_schedule_id UUID := COALESCE(NEW.schedule_id, OLD.schedule_id);
+BEGIN
+  IF v_thesis_id IS NOT NULL AND EXISTS (
+    SELECT 1 FROM public.exam_schedules es
+    WHERE es.id = v_schedule_id AND es.exam_type = 'defense'
+  ) THEN
+    UPDATE public.official_decrees
+    SET needs_reissue = TRUE
+    WHERE thesis_id = v_thesis_id
+      AND decree_type = 'sk_penguji'
+      AND is_latest = TRUE;
+  END IF;
+  RETURN COALESCE(NEW, OLD);
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_examiners_mark_decree_reissue ON public.examiner_assignments;
+CREATE TRIGGER trg_examiners_mark_decree_reissue
+  AFTER INSERT OR UPDATE OR DELETE ON public.examiner_assignments
+  FOR EACH ROW EXECUTE FUNCTION public.handle_examiner_changed_mark_reissue();
 
 CREATE OR REPLACE FUNCTION public.prevent_self_role_escalation()
 RETURNS TRIGGER
@@ -1794,6 +1929,40 @@ CREATE POLICY "activity_logs_insert" ON public.activity_logs FOR INSERT WITH CHE
   auth.uid() IS NOT NULL
 );
 
+-- Official Decrees RLS (Student strictly reads/downloads own decrees; modifications & v2+ re-issuance strictly admin-only)
+ALTER TABLE public.official_decrees ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "official_decrees_select" ON public.official_decrees;
+CREATE POLICY "official_decrees_select" ON public.official_decrees FOR SELECT USING (
+  student_id = auth.uid() OR public.is_program_admin()
+);
+
+DROP POLICY IF EXISTS "official_decrees_insert" ON public.official_decrees;
+CREATE POLICY "official_decrees_insert" ON public.official_decrees FOR INSERT WITH CHECK (
+  public.is_program_admin()
+  OR (
+    student_id = auth.uid()
+    AND version_number = 1
+    AND is_latest = TRUE
+    AND NOT EXISTS (
+      SELECT 1 FROM public.official_decrees od
+      WHERE od.thesis_id = official_decrees.thesis_id
+        AND od.decree_type = official_decrees.decree_type
+    )
+    AND public.can_student_bootstrap_decree(official_decrees.thesis_id, official_decrees.decree_type)
+  )
+);
+
+DROP POLICY IF EXISTS "official_decrees_update_admin" ON public.official_decrees;
+CREATE POLICY "official_decrees_update_admin" ON public.official_decrees FOR UPDATE USING (
+  public.is_program_admin()
+);
+
+DROP POLICY IF EXISTS "official_decrees_delete_admin" ON public.official_decrees;
+CREATE POLICY "official_decrees_delete_admin" ON public.official_decrees FOR DELETE USING (
+  public.is_program_admin()
+);
+
 -- ============================================================================
 -- SECTION 6B: POSTGRESQL TABLE, SCHEMA & SEQUENCE GRANTS (REQUIRED FOR SUPABASE)
 -- ============================================================================
@@ -1832,7 +2001,8 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON
   public.exam_scores,
   public.plagiarism_checks,
   public.graduation_records,
-  public.notifications
+  public.notifications,
+  public.official_decrees
 TO authenticated;
 
 -- Activity logs remain immutable (append-only for authenticated)
@@ -1854,7 +2024,8 @@ VALUES
   ('seminar-documents', 'seminar-documents', FALSE),
   ('defense-documents', 'defense-documents', FALSE),
   ('plagiarism-documents', 'plagiarism-documents', FALSE),
-  ('graduation-documents', 'graduation-documents', FALSE)
+  ('graduation-documents', 'graduation-documents', FALSE),
+  ('official-decrees', 'official-decrees', FALSE)
 ON CONFLICT (id) DO NOTHING;
 
 DROP POLICY IF EXISTS "storage_authenticated_upload" ON storage.objects;
@@ -1864,7 +2035,8 @@ TO authenticated
 WITH CHECK (
   bucket_id IN (
     'avatars', 'thesis-documents', 'thesis-proposals',
-    'seminar-documents', 'defense-documents', 'plagiarism-documents', 'graduation-documents'
+    'seminar-documents', 'defense-documents', 'plagiarism-documents', 'graduation-documents',
+    'official-decrees'
   )
   AND (
     (storage.foldername(name))[1] = auth.uid()::text
@@ -1877,15 +2049,24 @@ CREATE POLICY "storage_authenticated_read"
 ON storage.objects FOR SELECT
 TO authenticated
 USING (
-  bucket_id IN (
-    'avatars', 'thesis-documents', 'thesis-proposals',
-    'seminar-documents', 'defense-documents', 'plagiarism-documents', 'graduation-documents'
+  (
+    bucket_id = 'official-decrees'
+    AND (
+      (storage.foldername(name))[1] = auth.uid()::text
+      OR public.is_program_admin()
+    )
   )
-  AND (
-    (storage.foldername(name))[1] = auth.uid()::text
-    OR public.is_program_admin()
-    OR public.is_lecturer()
-    OR bucket_id = 'avatars'
+  OR (
+    bucket_id IN (
+      'avatars', 'thesis-documents', 'thesis-proposals',
+      'seminar-documents', 'defense-documents', 'plagiarism-documents', 'graduation-documents'
+    )
+    AND (
+      (storage.foldername(name))[1] = auth.uid()::text
+      OR public.is_program_admin()
+      OR public.is_lecturer()
+      OR bucket_id = 'avatars'
+    )
   )
 );
 
@@ -1894,8 +2075,17 @@ CREATE POLICY "storage_authenticated_update"
 ON storage.objects FOR UPDATE
 TO authenticated
 USING (
-  (storage.foldername(name))[1] = auth.uid()::text
-  OR public.is_program_admin()
+  (
+    bucket_id = 'official-decrees'
+    AND public.is_program_admin()
+  )
+  OR (
+    bucket_id <> 'official-decrees'
+    AND (
+      (storage.foldername(name))[1] = auth.uid()::text
+      OR public.is_program_admin()
+    )
+  )
 );
 
 DROP POLICY IF EXISTS "storage_authenticated_delete" ON storage.objects;
@@ -1903,8 +2093,17 @@ CREATE POLICY "storage_authenticated_delete"
 ON storage.objects FOR DELETE
 TO authenticated
 USING (
-  (storage.foldername(name))[1] = auth.uid()::text
-  OR public.is_program_admin()
+  (
+    bucket_id = 'official-decrees'
+    AND public.is_program_admin()
+  )
+  OR (
+    bucket_id <> 'official-decrees'
+    AND (
+      (storage.foldername(name))[1] = auth.uid()::text
+      OR public.is_program_admin()
+    )
+  )
 );
 
 -- ============================================================================
@@ -1935,7 +2134,8 @@ BEGIN
     'plagiarism_checks',
     'graduation_records',
     'notifications',
-    'system_settings'
+    'system_settings',
+    'official_decrees'
   ]
   LOOP
     BEGIN
@@ -2022,6 +2222,14 @@ WHERE NOT EXISTS (SELECT 1 FROM public.submission_requirements WHERE stage = 'ti
 INSERT INTO public.submission_requirements (program_id, stage, title, description, requirement_type, rule_key, rule_value, is_required, sort_order)
 SELECT NULL, 'title_submission', 'Lulus Mata Kuliah Metodologi Penelitian', 'Telah menyelesaikan mata kuliah wajib Metodologi Penelitian.', 'academic', 'mandatory_course', 'Metodologi Penelitian', TRUE, 4
 WHERE NOT EXISTS (SELECT 1 FROM public.submission_requirements WHERE stage = 'title_submission' AND rule_key = 'mandatory_course');
+
+INSERT INTO public.submission_requirements (program_id, stage, title, description, requirement_type, rule_key, rule_value, is_required, sort_order)
+SELECT NULL, 'seminar_proposal', 'Bab 1 s/d Bab 3 Disetujui Pembimbing', 'Bab 1 (Pendahuluan), Bab 2 (Tinjauan Pustaka), dan Bab 3 (Metodologi Penelitian) telah diverifikasi dan disetujui oleh dosen pembimbing.', 'document', 'chapters_1_3_approved', '3', TRUE, 1
+WHERE NOT EXISTS (SELECT 1 FROM public.submission_requirements WHERE stage = 'seminar_proposal' AND rule_key = 'chapters_1_3_approved');
+
+INSERT INTO public.submission_requirements (program_id, stage, title, description, requirement_type, rule_key, rule_value, is_required, sort_order)
+SELECT NULL, 'seminar_proposal', 'Persetujuan Seminar Proposal Pembimbing', 'Dosen pembimbing telah memberikan persetujuan (ACC) untuk mengikuti seminar proposal.', 'academic', 'supervisor_approval', 'true', TRUE, 2
+WHERE NOT EXISTS (SELECT 1 FROM public.submission_requirements WHERE stage = 'seminar_proposal' AND rule_key = 'supervisor_approval');
 
 INSERT INTO public.submission_requirements (program_id, stage, title, description, requirement_type, rule_key, rule_value, is_required, sort_order)
 SELECT NULL, 'defense_registration', 'Seluruh Bab 1 - 5 Disetujui', 'Seluruh bab tugas akhir telah diverifikasi dan disetujui oleh dosen pembimbing.', 'document', 'chapters_approved', '5', TRUE, 1

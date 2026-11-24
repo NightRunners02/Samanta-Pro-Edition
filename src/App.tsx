@@ -116,13 +116,13 @@ function TAFlowRouter() {
       case 'documents':
         return <DocumentCenterPage />;
       case 'seminar':
-        return <SeminarProposalPage />;
+        return <SeminarProposalPage onNavigate={setActivePage} />;
       case 'defense':
         return <DefenseRegistrationPage />;
       case 'plagiarism':
-        return <PlagiarismPage />;
+        return <PlagiarismPage onNavigate={setActivePage} />;
       case 'yudisium':
-        return <YudisiumPage />;
+        return <YudisiumPage onNavigate={setActivePage} />;
 
       // Lecturer
       case 'supervisees':
