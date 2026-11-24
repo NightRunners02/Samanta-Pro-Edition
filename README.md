@@ -1,6 +1,6 @@
 <div align="center">
 
-# TAFlow — Integrated Academic Thesis Management System
+# TAFlow - Integrated Academic Thesis Management System
 
 **Platform manajemen tugas akhir (skripsi/tesis) terpadu end-to-end — mulai dari pengajuan judul, penetapan pembimbing, bimbingan digital, progres bab, seminar proposal, sidang akhir, verifikasi plagiasi, hingga yudisium.**
 
