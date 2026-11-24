@@ -1,7 +1,11 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { Calendar, CheckCircle2, Clock, Loader2, Send, AlertCircle } from 'lucide-react';
+import { AlertCircle, Calendar, CheckCircle2, Clock, Loader2, Send } from 'lucide-react';
 import { EmptyState } from '../../components/ui/EmptyState';
 import { FileUploadField } from '../../components/ui/FileUploadField';
+import {
+  RealtimeDocumentPreviewPanel,
+  SavedDocumentCard,
+} from '../../components/ui/RealtimeDocumentPreviewPanel';
 import { TableSkeleton } from '../../components/ui/Skeleton';
 import { StatusBadge } from '../../components/ui/StatusBadge';
 import { useAuth } from '../../contexts/AuthContext';
@@ -13,6 +17,7 @@ import type {
   ExaminerAssignment,
   SeminarRegistration,
   SubmissionRequirement,
+  ThesisDocument,
   ThesisSubmission,
 } from '../../types/database';
 
@@ -24,82 +29,157 @@ export function SeminarProposalPage() {
   const [submitting, setSubmitting] = useState(false);
   const [thesis, setThesis] = useState<ThesisSubmission | null>(null);
   const [registration, setRegistration] = useState<SeminarRegistration | null>(null);
+  const [proposalDoc, setProposalDoc] = useState<ThesisDocument | null>(null);
+  const [supportingDoc, setSupportingDoc] = useState<ThesisDocument | null>(null);
   const [requirements, setRequirements] = useState<SubmissionRequirement[]>([]);
   const [schedule, setSchedule] = useState<ExamSchedule | null>(null);
   const [examiners, setExaminers] = useState<ExaminerAssignment[]>([]);
 
   const [proposalFile, setProposalFile] = useState<File | null>(null);
   const [supportingFile, setSupportingFile] = useState<File | null>(null);
+  const [activePreviewSlot, setActivePreviewSlot] = useState<'proposal' | 'supporting'>('proposal');
 
-  const loadData = useCallback(async () => {
-    if (!profile?.id) return;
-    setLoading(true);
+  const loadData = useCallback(
+    async (opts?: { silent?: boolean }) => {
+      if (!profile?.id) return;
+      if (!opts?.silent) setLoading(true);
 
-    const { data: tData } = await supabase
-      .from('thesis_submissions')
-      .select('*')
-      .eq('student_id', profile.id)
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
+      const { data: tData } = await supabase
+        .from('thesis_submissions')
+        .select('*')
+        .eq('student_id', profile.id)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
 
-    const currentThesis = (tData as ThesisSubmission) || null;
-    setThesis(currentThesis);
+      const currentThesis = (tData as ThesisSubmission) || null;
+      setThesis(currentThesis);
 
-    const { data: reqData } = await supabase
-      .from('submission_requirements')
-      .select('*')
-      .eq('stage', 'seminar_proposal')
-      .eq('is_active', true)
-      .order('sort_order');
+      const { data: reqData } = await supabase
+        .from('submission_requirements')
+        .select('*')
+        .eq('stage', 'seminar_proposal')
+        .eq('is_active', true)
+        .order('sort_order');
 
-    setRequirements(
-      ((reqData || []) as SubmissionRequirement[]).filter(
-        (r) => !r.program_id || r.program_id === profile.program_id
-      )
-    );
+      setRequirements(
+        ((reqData || []) as SubmissionRequirement[]).filter(
+          (r) => !r.program_id || r.program_id === profile.program_id
+        )
+      );
 
-    if (currentThesis) {
-      const [{ data: regData }, { data: schedData }] = await Promise.all([
-        supabase
-          .from('seminar_registrations')
-          .select('*')
-          .eq('thesis_id', currentThesis.id)
-          .order('created_at', { ascending: false })
-          .limit(1)
-          .maybeSingle(),
-        supabase
-          .from('exam_schedules')
-          .select('*')
-          .eq('thesis_id', currentThesis.id)
-          .eq('exam_type', 'seminar')
-          .order('created_at', { ascending: false })
-          .limit(1)
-          .maybeSingle(),
-      ]);
+      if (currentThesis) {
+        const [{ data: regData }, { data: schedData }] = await Promise.all([
+          supabase
+            .from('seminar_registrations')
+            .select('*')
+            .eq('thesis_id', currentThesis.id)
+            .order('created_at', { ascending: false })
+            .limit(1)
+            .maybeSingle(),
+          supabase
+            .from('exam_schedules')
+            .select('*')
+            .eq('thesis_id', currentThesis.id)
+            .eq('exam_type', 'seminar')
+            .order('created_at', { ascending: false })
+            .limit(1)
+            .maybeSingle(),
+        ]);
 
-      setRegistration((regData as SeminarRegistration) || null);
-      const sched = (schedData as ExamSchedule) || null;
-      setSchedule(sched);
+        const currentReg = (regData as SeminarRegistration) || null;
+        setRegistration(currentReg);
 
-      if (sched) {
-        const { data: exData } = await supabase
-          .from('examiner_assignments')
-          .select('*, lecturer:profiles!examiner_assignments_lecturer_id_fkey(*)')
-          .eq('schedule_id', sched.id);
-        setExaminers((exData || []) as ExaminerAssignment[]);
+        const docIds = [currentReg?.proposal_document_id, currentReg?.supporting_document_id].filter(
+          Boolean
+        ) as string[];
+        if (docIds.length > 0) {
+          const { data: docsData } = await supabase
+            .from('thesis_documents')
+            .select('*')
+            .in('id', docIds);
+          const docsMap = new Map<string, ThesisDocument>(
+            ((docsData || []) as ThesisDocument[]).map((d) => [d.id, d])
+          );
+          setProposalDoc(
+            currentReg?.proposal_document_id ? docsMap.get(currentReg.proposal_document_id) || null : null
+          );
+          setSupportingDoc(
+            currentReg?.supporting_document_id ? docsMap.get(currentReg.supporting_document_id) || null : null
+          );
+        } else {
+          setProposalDoc(null);
+          setSupportingDoc(null);
+        }
+
+        const sched = (schedData as ExamSchedule) || null;
+        setSchedule(sched);
+
+        if (sched) {
+          const { data: exData } = await supabase
+            .from('examiner_assignments')
+            .select('*, lecturer:profiles!examiner_assignments_lecturer_id_fkey(*)')
+            .eq('schedule_id', sched.id);
+          setExaminers((exData || []) as ExaminerAssignment[]);
+        } else {
+          setExaminers([]);
+        }
+      } else {
+        setRegistration(null);
+        setProposalDoc(null);
+        setSupportingDoc(null);
+        setSchedule(null);
+        setExaminers([]);
       }
-    }
 
-    setLoading(false);
-  }, [profile?.id, profile?.program_id]);
+      if (!opts?.silent) setLoading(false);
+    },
+    [profile?.id, profile?.program_id]
+  );
 
   useEffect(() => {
     loadData();
   }, [loadData]);
 
+  // Realtime sync for registration status, documents, and exam schedules
+  useEffect(() => {
+    if (!profile?.id) return;
+    const channel = supabase
+      .channel(`student_seminar_realtime_${profile.id}`)
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'seminar_registrations', filter: `student_id=eq.${profile.id}` },
+        () => loadData({ silent: true })
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'thesis_documents', filter: `student_id=eq.${profile.id}` },
+        () => loadData({ silent: true })
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'exam_schedules', filter: `student_id=eq.${profile.id}` },
+        () => loadData({ silent: true })
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [profile?.id, loadData]);
+
   const canSubmit =
     !registration || ['draft', 'revision_required', 'rejected'].includes(registration.status);
+
+  const handleSelectProposalFile = (file: File | null) => {
+    setProposalFile(file);
+    if (file) setActivePreviewSlot('proposal');
+  };
+
+  const handleSelectSupportingFile = (file: File | null) => {
+    setSupportingFile(file);
+    if (file) setActivePreviewSlot('supporting');
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -121,6 +201,8 @@ export function SeminarProposalPage() {
         category: 'seminar_document',
         title: `Naskah Seminar Proposal — ${thesis.title}`,
         thesisId: thesis.id,
+        parentDocumentId: propId,
+        versionNumber: proposalDoc ? proposalDoc.version_number + 1 : 1,
         maxUploadMb: systemSettings?.max_upload_mb || 25,
       });
       if (up.error) {
@@ -139,6 +221,8 @@ export function SeminarProposalPage() {
         category: 'supporting_document',
         title: `Bukti Persyaratan Seminar — ${profile.full_name}`,
         thesisId: thesis.id,
+        parentDocumentId: suppId,
+        versionNumber: supportingDoc ? supportingDoc.version_number + 1 : 1,
         maxUploadMb: systemSettings?.max_upload_mb || 25,
       });
       if (up2.error) {
@@ -175,7 +259,7 @@ export function SeminarProposalPage() {
     setProposalFile(null);
     setSupportingFile(null);
     showToast('Pendaftaran seminar proposal dikirim', 'success');
-    loadData();
+    loadData({ silent: true });
   };
 
   if (loading) return <TableSkeleton rows={4} columns={3} />;
@@ -191,7 +275,7 @@ export function SeminarProposalPage() {
   }
 
   return (
-    <div className="space-y-6 max-w-4xl">
+    <div className="space-y-6 max-w-7xl">
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
           <h1 className="text-xl font-bold tracking-tight">Pendaftaran Seminar Proposal</h1>
@@ -267,38 +351,117 @@ export function SeminarProposalPage() {
         </div>
       )}
 
-      <form
-        onSubmit={handleSubmit}
-        className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-6 space-y-4"
-      >
-        <h2 className="text-sm font-semibold">Dokumen Pendaftaran Seminar</h2>
-        <FileUploadField
-          label="Naskah Proposal Seminar (PDF) *"
-          accept=".pdf,.docx"
-          selectedFile={proposalFile}
-          onSelectFile={setProposalFile}
-          helperText={registration?.proposal_document_id ? 'Proposal sudah terunggah. Pilih file baru jika ingin mengganti.' : undefined}
-        />
-        <FileUploadField
-          label="Bukti Persyaratan Administrasi / Kartu Bimbingan (PDF/Gambar)"
-          accept=".pdf,.png,.jpg,.jpeg"
-          selectedFile={supportingFile}
-          onSelectFile={setSupportingFile}
-        />
-
-        {canSubmit && (
-          <div className="flex justify-end pt-2">
-            <button
-              type="submit"
-              disabled={submitting}
-              className="inline-flex items-center gap-2 px-4 py-2 text-xs font-medium rounded-lg bg-blue-700 hover:bg-blue-800 text-white"
-            >
-              {submitting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Send className="w-3.5 h-3.5" />}
-              Ajukan Seminar Proposal
-            </button>
+      {/* Side-by-Side Document Upload & Realtime Preview */}
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+        <form
+          onSubmit={handleSubmit}
+          className="lg:col-span-5 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-6 space-y-4"
+        >
+          <div className="flex items-center justify-between gap-2">
+            <h2 className="text-sm font-semibold">Dokumen Pendaftaran Seminar</h2>
+            {registration && <StatusBadge status={registration.status} />}
           </div>
-        )}
-      </form>
+
+          {proposalDoc && (
+            <SavedDocumentCard
+              label="Naskah Proposal Tersimpan"
+              doc={proposalDoc}
+              isActivePreview={activePreviewSlot === 'proposal' && !proposalFile}
+              replacedByLocalFile={proposalFile}
+              onPreview={() => setActivePreviewSlot('proposal')}
+            />
+          )}
+
+          {canSubmit && (
+            <FileUploadField
+              label={
+                proposalDoc
+                  ? 'Ganti Naskah Proposal Seminar (PDF/DOCX)'
+                  : 'Naskah Proposal Seminar (PDF) *'
+              }
+              accept=".pdf,.docx"
+              maxMb={systemSettings?.max_upload_mb || 25}
+              selectedFile={proposalFile}
+              onSelectFile={handleSelectProposalFile}
+              helperText={
+                proposalDoc
+                  ? 'Berkas tersimpan tetap aman jika Anda tidak memilih file baru.'
+                  : undefined
+              }
+            />
+          )}
+
+          {supportingDoc && (
+            <SavedDocumentCard
+              label="Bukti Persyaratan Tersimpan"
+              doc={supportingDoc}
+              isActivePreview={activePreviewSlot === 'supporting' && !supportingFile}
+              replacedByLocalFile={supportingFile}
+              onPreview={() => setActivePreviewSlot('supporting')}
+            />
+          )}
+
+          {canSubmit && (
+            <FileUploadField
+              label={
+                supportingDoc
+                  ? 'Ganti Bukti Persyaratan Administrasi (PDF/Gambar)'
+                  : 'Bukti Persyaratan Administrasi / Kartu Bimbingan (PDF/Gambar)'
+              }
+              accept=".pdf,.png,.jpg,.jpeg"
+              maxMb={systemSettings?.max_upload_mb || 25}
+              selectedFile={supportingFile}
+              onSelectFile={handleSelectSupportingFile}
+              helperText={
+                supportingDoc
+                  ? 'Berkas tersimpan tetap aman jika Anda tidak memilih file baru.'
+                  : undefined
+              }
+            />
+          )}
+
+          {!canSubmit && (
+            <p className="text-[11px] text-slate-500 dark:text-slate-400 rounded-lg bg-slate-50 dark:bg-slate-950/60 border border-slate-200 dark:border-slate-800 px-3 py-2">
+              Pendaftaran seminar telah dikirim. Berkas Anda tetap tersimpan dan dapat dipratinjau di panel sebelah kanan.
+            </p>
+          )}
+
+          {canSubmit && (
+            <div className="flex justify-end pt-2">
+              <button
+                type="submit"
+                disabled={submitting}
+                className="inline-flex items-center gap-2 px-4 py-2 text-xs font-medium rounded-lg bg-blue-700 hover:bg-blue-800 text-white"
+              >
+                {submitting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Send className="w-3.5 h-3.5" />}
+                Ajukan Seminar Proposal
+              </button>
+            </div>
+          )}
+        </form>
+
+        <div className="lg:col-span-7">
+          <RealtimeDocumentPreviewPanel
+            title="Realtime Preview Dokumen Seminar"
+            activeSlotId={activePreviewSlot}
+            onSelectSlot={(id) => setActivePreviewSlot(id as 'proposal' | 'supporting')}
+            slots={[
+              {
+                id: 'proposal',
+                label: 'Naskah Proposal',
+                localFile: proposalFile,
+                savedDoc: proposalDoc,
+              },
+              {
+                id: 'supporting',
+                label: 'Bukti Persyaratan',
+                localFile: supportingFile,
+                savedDoc: supportingDoc,
+              },
+            ]}
+          />
+        </div>
+      </div>
     </div>
   );
 }

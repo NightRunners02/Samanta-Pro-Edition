@@ -318,6 +318,8 @@ export interface SeminarRegistration {
   created_at: string;
   student?: Profile;
   thesis?: ThesisSubmission;
+  proposal_document?: ThesisDocument | null;
+  supporting_document?: ThesisDocument | null;
 }
 
 export interface DefenseRegistration {
@@ -338,6 +340,8 @@ export interface DefenseRegistration {
   created_at: string;
   student?: Profile;
   thesis?: ThesisSubmission;
+  full_thesis_document?: ThesisDocument | null;
+  supporting_document?: ThesisDocument | null;
 }
 
 export interface ExamSchedule {
@@ -408,6 +412,7 @@ export interface PlagiarismCheck {
   student?: Profile;
   thesis?: ThesisSubmission;
   document?: ThesisDocument | null;
+  supporting_document?: ThesisDocument | null;
 }
 
 export interface GraduationRecord {

@@ -320,6 +320,11 @@ CREATE TABLE IF NOT EXISTS public.seminar_registrations (
 );
 
 CREATE INDEX IF NOT EXISTS idx_seminar_student ON public.seminar_registrations(student_id);
+CREATE INDEX IF NOT EXISTS idx_seminar_thesis ON public.seminar_registrations(thesis_id);
+
+ALTER TABLE public.seminar_registrations
+  ADD COLUMN IF NOT EXISTS proposal_document_id UUID REFERENCES public.thesis_documents(id) ON DELETE SET NULL,
+  ADD COLUMN IF NOT EXISTS supporting_document_id UUID REFERENCES public.thesis_documents(id) ON DELETE SET NULL;
 
 -- 14. defense_registrations
 CREATE TABLE IF NOT EXISTS public.defense_registrations (
@@ -342,6 +347,11 @@ CREATE TABLE IF NOT EXISTS public.defense_registrations (
 );
 
 CREATE INDEX IF NOT EXISTS idx_defense_student ON public.defense_registrations(student_id);
+CREATE INDEX IF NOT EXISTS idx_defense_thesis ON public.defense_registrations(thesis_id);
+
+ALTER TABLE public.defense_registrations
+  ADD COLUMN IF NOT EXISTS full_thesis_document_id UUID REFERENCES public.thesis_documents(id) ON DELETE SET NULL,
+  ADD COLUMN IF NOT EXISTS supporting_document_id UUID REFERENCES public.thesis_documents(id) ON DELETE SET NULL;
 
 -- 15. exam_schedules
 CREATE TABLE IF NOT EXISTS public.exam_schedules (
@@ -426,6 +436,11 @@ CREATE TABLE IF NOT EXISTS public.plagiarism_checks (
 );
 
 CREATE INDEX IF NOT EXISTS idx_plagiarism_student ON public.plagiarism_checks(student_id);
+CREATE INDEX IF NOT EXISTS idx_plagiarism_thesis ON public.plagiarism_checks(thesis_id);
+
+ALTER TABLE public.plagiarism_checks
+  ADD COLUMN IF NOT EXISTS document_id UUID REFERENCES public.thesis_documents(id) ON DELETE SET NULL,
+  ADD COLUMN IF NOT EXISTS supporting_document_id UUID REFERENCES public.thesis_documents(id) ON DELETE SET NULL;
 
 -- 19. graduation_records (Yudisium)
 CREATE TABLE IF NOT EXISTS public.graduation_records (
@@ -503,6 +518,10 @@ CREATE TABLE IF NOT EXISTS public.system_settings (
   updated_by UUID REFERENCES public.profiles(id) ON DELETE SET NULL,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE public.system_settings
+  ADD COLUMN IF NOT EXISTS logo_url TEXT,
+  ADD COLUMN IF NOT EXISTS favicon_url TEXT;
 
 -- Attach updated_at triggers
 DO $$
@@ -1907,15 +1926,23 @@ BEGIN
     'thesis_progress',
     'supervision_sessions',
     'thesis_documents',
+    'document_reviews',
     'seminar_registrations',
     'defense_registrations',
     'exam_schedules',
+    'examiner_assignments',
     'exam_scores',
     'plagiarism_checks',
     'graduation_records',
-    'notifications'
+    'notifications',
+    'system_settings'
   ]
   LOOP
+    BEGIN
+      EXECUTE format('ALTER TABLE public.%I REPLICA IDENTITY FULL;', tbl);
+    EXCEPTION WHEN OTHERS THEN
+      NULL;
+    END;
     BEGIN
       EXECUTE format('ALTER PUBLICATION supabase_realtime ADD TABLE public.%I;', tbl);
     EXCEPTION WHEN duplicate_object THEN
@@ -1971,8 +1998,11 @@ VALUES
   ('2026-1', 'Semester Ganjil 2026/2027', '2026/2027', 'Ganjil', '2026-09-01', '2027-01-31', '2026-09-01', '2026-12-31', TRUE)
 ON CONFLICT (code) DO NOTHING;
 
-INSERT INTO public.system_settings (app_name, active_period_id, max_supervisors, max_examiners, default_min_sks, default_min_gpa, default_max_plagiarism_pct, max_upload_mb)
-SELECT 'TAFlow', id, 2, 3, 110, 2.75, 25.00, 25
+INSERT INTO public.system_settings (app_name, favicon_url, active_period_id, max_supervisors, max_examiners, default_min_sks, default_min_gpa, default_max_plagiarism_pct, max_upload_mb)
+SELECT
+  'TAFlow',
+  'data:image/svg+xml;utf8,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2064%2064%22%20fill%3D%22none%22%3E%3Cdefs%3E%3ClinearGradient%20id%3D%22bg1%22%20x1%3D%220%22%20y1%3D%220%22%20x2%3D%2264%22%20y2%3D%2264%22%20gradientUnits%3D%22userSpaceOnUse%22%3E%3Cstop%20offset%3D%220%25%22%20stop-color%3D%22%230F172A%22%2F%3E%3Cstop%20offset%3D%22100%25%22%20stop-color%3D%22%231D4ED8%22%2F%3E%3C%2FlinearGradient%3E%3ClinearGradient%20id%3D%22cy1%22%20x1%3D%2216%22%20y1%3D%2216%22%20x2%3D%2250%22%20y2%3D%2250%22%20gradientUnits%3D%22userSpaceOnUse%22%3E%3Cstop%20offset%3D%220%25%22%20stop-color%3D%22%2338BDF8%22%2F%3E%3Cstop%20offset%3D%22100%25%22%20stop-color%3D%22%2306B6D4%22%2F%3E%3C%2FlinearGradient%3E%3C%2Fdefs%3E%3Crect%20width%3D%2264%22%20height%3D%2264%22%20rx%3D%2216%22%20fill%3D%22url(%23bg1)%22%2F%3E%3Cpath%20d%3D%22M32%2011L49%2018.5V31.5C49%2042.2%2041.7%2050.8%2032%2054C22.3%2050.8%2015%2042.2%2015%2031.5V18.5L32%2011Z%22%20stroke%3D%22url(%23cy1)%22%20stroke-width%3D%222.75%22%20fill%3D%22%230F172A%22%20fill-opacity%3D%220.45%22%2F%3E%3Cpath%20d%3D%22M23%2026H41M32%2026V42%22%20stroke%3D%22%23FFFFFF%22%20stroke-width%3D%223.2%22%20stroke-linecap%3D%22round%22%2F%3E%3Cpath%20d%3D%22M24%2038C28.5%2034.5%2035.5%2034.5%2040%2038%22%20stroke%3D%22%2322D3EE%22%20stroke-width%3D%222.6%22%20stroke-linecap%3D%22round%22%2F%3E%3C%2Fsvg%3E',
+  id, 2, 3, 110, 2.75, 25.00, 25
 FROM public.academic_periods WHERE code = '2026-1'
 AND NOT EXISTS (SELECT 1 FROM public.system_settings);
 

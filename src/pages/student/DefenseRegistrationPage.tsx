@@ -2,6 +2,10 @@ import React, { useCallback, useEffect, useState } from 'react';
 import { AlertCircle, Award, CheckCircle2, Loader2, Send } from 'lucide-react';
 import { EmptyState } from '../../components/ui/EmptyState';
 import { FileUploadField } from '../../components/ui/FileUploadField';
+import {
+  RealtimeDocumentPreviewPanel,
+  SavedDocumentCard,
+} from '../../components/ui/RealtimeDocumentPreviewPanel';
 import { TableSkeleton } from '../../components/ui/Skeleton';
 import { StatusBadge } from '../../components/ui/StatusBadge';
 import { useAuth } from '../../contexts/AuthContext';
@@ -16,6 +20,7 @@ import type {
   Program,
   SubmissionRequirement,
   SupervisionSession,
+  ThesisDocument,
   ThesisProgress,
   ThesisSubmission,
 } from '../../types/database';
@@ -32,93 +37,169 @@ export function DefenseRegistrationPage() {
   const [sessions, setSessions] = useState<SupervisionSession[]>([]);
   const [requirements, setRequirements] = useState<SubmissionRequirement[]>([]);
   const [registration, setRegistration] = useState<DefenseRegistration | null>(null);
+  const [fullThesisDoc, setFullThesisDoc] = useState<ThesisDocument | null>(null);
+  const [supportingDoc, setSupportingDoc] = useState<ThesisDocument | null>(null);
   const [schedule, setSchedule] = useState<ExamSchedule | null>(null);
   const [examiners, setExaminers] = useState<ExaminerAssignment[]>([]);
   const [scores, setScores] = useState<ExamScore[]>([]);
 
   const [thesisFile, setThesisFile] = useState<File | null>(null);
   const [supportingFile, setSupportingFile] = useState<File | null>(null);
+  const [activePreviewSlot, setActivePreviewSlot] = useState<'full_thesis' | 'supporting'>('full_thesis');
 
-  const loadData = useCallback(async () => {
-    if (!profile?.id) return;
-    setLoading(true);
+  const loadData = useCallback(
+    async (opts?: { silent?: boolean }) => {
+      if (!profile?.id) return;
+      if (!opts?.silent) setLoading(true);
 
-    const [{ data: tData }, { data: progData }, { data: reqData }] = await Promise.all([
-      supabase
-        .from('thesis_submissions')
-        .select('*')
-        .eq('student_id', profile.id)
-        .order('created_at', { ascending: false })
-        .limit(1)
-        .maybeSingle(),
-      profile.program_id
-        ? supabase.from('programs').select('*').eq('id', profile.program_id).maybeSingle()
-        : Promise.resolve({ data: null }),
-      supabase
-        .from('submission_requirements')
-        .select('*')
-        .eq('stage', 'defense_registration')
-        .eq('is_active', true)
-        .order('sort_order'),
-    ]);
+      const [{ data: tData }, { data: progData }, { data: reqData }] = await Promise.all([
+        supabase
+          .from('thesis_submissions')
+          .select('*')
+          .eq('student_id', profile.id)
+          .order('created_at', { ascending: false })
+          .limit(1)
+          .maybeSingle(),
+        profile.program_id
+          ? supabase.from('programs').select('*').eq('id', profile.program_id).maybeSingle()
+          : Promise.resolve({ data: null }),
+        supabase
+          .from('submission_requirements')
+          .select('*')
+          .eq('stage', 'defense_registration')
+          .eq('is_active', true)
+          .order('sort_order'),
+      ]);
 
-    const currentThesis = (tData as ThesisSubmission) || null;
-    setThesis(currentThesis);
-    setProgram((progData as Program) || null);
-    setRequirements(
-      ((reqData || []) as SubmissionRequirement[]).filter(
-        (r) => !r.program_id || r.program_id === profile.program_id
-      )
-    );
+      const currentThesis = (tData as ThesisSubmission) || null;
+      setThesis(currentThesis);
+      setProgram((progData as Program) || null);
+      setRequirements(
+        ((reqData || []) as SubmissionRequirement[]).filter(
+          (r) => !r.program_id || r.program_id === profile.program_id
+        )
+      );
 
-    if (currentThesis) {
-      const [{ data: chData }, { data: sessData }, { data: regData }, { data: schedData }, { data: scoreData }] =
-        await Promise.all([
-          supabase.from('thesis_progress').select('*').eq('thesis_id', currentThesis.id),
-          supabase.from('supervision_sessions').select('*').eq('thesis_id', currentThesis.id),
-          supabase
-            .from('defense_registrations')
+      if (currentThesis) {
+        const [{ data: chData }, { data: sessData }, { data: regData }, { data: schedData }, { data: scoreData }] =
+          await Promise.all([
+            supabase.from('thesis_progress').select('*').eq('thesis_id', currentThesis.id),
+            supabase.from('supervision_sessions').select('*').eq('thesis_id', currentThesis.id),
+            supabase
+              .from('defense_registrations')
+              .select('*')
+              .eq('thesis_id', currentThesis.id)
+              .order('created_at', { ascending: false })
+              .limit(1)
+              .maybeSingle(),
+            supabase
+              .from('exam_schedules')
+              .select('*')
+              .eq('thesis_id', currentThesis.id)
+              .eq('exam_type', 'defense')
+              .order('created_at', { ascending: false })
+              .limit(1)
+              .maybeSingle(),
+            supabase
+              .from('exam_scores')
+              .select('*, examiner:profiles!exam_scores_examiner_id_fkey(*)')
+              .eq('thesis_id', currentThesis.id),
+          ]);
+
+        setChapters((chData || []) as ThesisProgress[]);
+        setSessions((sessData || []) as SupervisionSession[]);
+        const currentReg = (regData as DefenseRegistration) || null;
+        setRegistration(currentReg);
+
+        const docIds = [currentReg?.full_thesis_document_id, currentReg?.supporting_document_id].filter(
+          Boolean
+        ) as string[];
+        if (docIds.length > 0) {
+          const { data: docsData } = await supabase
+            .from('thesis_documents')
             .select('*')
-            .eq('thesis_id', currentThesis.id)
-            .order('created_at', { ascending: false })
-            .limit(1)
-            .maybeSingle(),
-          supabase
-            .from('exam_schedules')
-            .select('*')
-            .eq('thesis_id', currentThesis.id)
-            .eq('exam_type', 'defense')
-            .order('created_at', { ascending: false })
-            .limit(1)
-            .maybeSingle(),
-          supabase
-            .from('exam_scores')
-            .select('*, examiner:profiles!exam_scores_examiner_id_fkey(*)')
-            .eq('thesis_id', currentThesis.id),
-        ]);
+            .in('id', docIds);
+          const docsMap = new Map<string, ThesisDocument>(
+            ((docsData || []) as ThesisDocument[]).map((d) => [d.id, d])
+          );
+          setFullThesisDoc(
+            currentReg?.full_thesis_document_id ? docsMap.get(currentReg.full_thesis_document_id) || null : null
+          );
+          setSupportingDoc(
+            currentReg?.supporting_document_id ? docsMap.get(currentReg.supporting_document_id) || null : null
+          );
+        } else {
+          setFullThesisDoc(null);
+          setSupportingDoc(null);
+        }
 
-      setChapters((chData || []) as ThesisProgress[]);
-      setSessions((sessData || []) as SupervisionSession[]);
-      setRegistration((regData as DefenseRegistration) || null);
-      const sched = (schedData as ExamSchedule) || null;
-      setSchedule(sched);
-      setScores((scoreData || []) as ExamScore[]);
+        const sched = (schedData as ExamSchedule) || null;
+        setSchedule(sched);
+        setScores((scoreData || []) as ExamScore[]);
 
-      if (sched) {
-        const { data: exData } = await supabase
-          .from('examiner_assignments')
-          .select('*, lecturer:profiles!examiner_assignments_lecturer_id_fkey(*)')
-          .eq('schedule_id', sched.id);
-        setExaminers((exData || []) as ExaminerAssignment[]);
+        if (sched) {
+          const { data: exData } = await supabase
+            .from('examiner_assignments')
+            .select('*, lecturer:profiles!examiner_assignments_lecturer_id_fkey(*)')
+            .eq('schedule_id', sched.id);
+          setExaminers((exData || []) as ExaminerAssignment[]);
+        } else {
+          setExaminers([]);
+        }
+      } else {
+        setRegistration(null);
+        setFullThesisDoc(null);
+        setSupportingDoc(null);
+        setSchedule(null);
+        setExaminers([]);
+        setScores([]);
       }
-    }
 
-    setLoading(false);
-  }, [profile?.id, profile?.program_id]);
+      if (!opts?.silent) setLoading(false);
+    },
+    [profile?.id, profile?.program_id]
+  );
 
   useEffect(() => {
     loadData();
   }, [loadData]);
+
+  // Realtime sync for defense registration, documents, schedules, scores, and prerequisites
+  useEffect(() => {
+    if (!profile?.id) return;
+    const channel = supabase
+      .channel(`student_defense_realtime_${profile.id}`)
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'defense_registrations', filter: `student_id=eq.${profile.id}` },
+        () => loadData({ silent: true })
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'thesis_documents', filter: `student_id=eq.${profile.id}` },
+        () => loadData({ silent: true })
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'exam_schedules', filter: `student_id=eq.${profile.id}` },
+        () => loadData({ silent: true })
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'thesis_progress', filter: `student_id=eq.${profile.id}` },
+        () => loadData({ silent: true })
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'supervision_sessions', filter: `student_id=eq.${profile.id}` },
+        () => loadData({ silent: true })
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [profile?.id, loadData]);
 
   const approvedChapters = chapters.filter((c) => c.status === 'approved').length;
   const completedGuidance = sessions.filter((s) => s.status === 'completed').length;
@@ -143,6 +224,16 @@ export function DefenseRegistrationPage() {
   const canSubmit =
     !registration || ['draft', 'revision_required', 'rejected'].includes(registration.status);
 
+  const handleSelectThesisFile = (file: File | null) => {
+    setThesisFile(file);
+    if (file) setActivePreviewSlot('full_thesis');
+  };
+
+  const handleSelectSupportingFile = (file: File | null) => {
+    setSupportingFile(file);
+    if (file) setActivePreviewSlot('supporting');
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!profile || !thesis) return;
@@ -163,6 +254,8 @@ export function DefenseRegistrationPage() {
         category: 'full_thesis',
         title: `Naskah Lengkap Sidang — ${thesis.title}`,
         thesisId: thesis.id,
+        parentDocumentId: fullDocId,
+        versionNumber: fullThesisDoc ? fullThesisDoc.version_number + 1 : 1,
         maxUploadMb: systemSettings?.max_upload_mb || 25,
       });
       if (up.error) {
@@ -181,6 +274,9 @@ export function DefenseRegistrationPage() {
         category: 'defense_document',
         title: `Berkas Persyaratan Sidang — ${profile.full_name}`,
         thesisId: thesis.id,
+        parentDocumentId: suppDocId,
+        versionNumber: supportingDoc ? supportingDoc.version_number + 1 : 1,
+        maxUploadMb: systemSettings?.max_upload_mb || 25,
       });
       if (up2.error) {
         setSubmitting(false);
@@ -216,7 +312,7 @@ export function DefenseRegistrationPage() {
     setThesisFile(null);
     setSupportingFile(null);
     showToast('Pendaftaran sidang akhir berhasil dikirim', 'success');
-    loadData();
+    loadData({ silent: true });
   };
 
   const finalAverage =
@@ -237,7 +333,7 @@ export function DefenseRegistrationPage() {
   }
 
   return (
-    <div className="space-y-6 max-w-5xl">
+    <div className="space-y-6 max-w-7xl">
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
           <h1 className="text-xl font-bold tracking-tight">Pendaftaran Sidang Akhir & Hasil Penilaian</h1>
@@ -371,37 +467,117 @@ export function DefenseRegistrationPage() {
         </div>
       )}
 
-      {/* Registration Form */}
-      <form
-        onSubmit={handleSubmit}
-        className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-6 space-y-4"
-      >
-        <h2 className="text-sm font-semibold">Berkas Pendaftaran Sidang Akhir</h2>
-        <FileUploadField
-          label="Naskah Skripsi Lengkap / Full Thesis (PDF) *"
-          accept=".pdf"
-          selectedFile={thesisFile}
-          onSelectFile={setThesisFile}
-        />
-        <FileUploadField
-          label="Berkas Pendukung Persyaratan Sidang (PDF)"
-          accept=".pdf,.png,.jpg"
-          selectedFile={supportingFile}
-          onSelectFile={setSupportingFile}
-        />
-        {canSubmit && (
-          <div className="flex justify-end pt-2">
-            <button
-              type="submit"
-              disabled={submitting}
-              className="inline-flex items-center gap-2 px-4 py-2 text-xs font-medium rounded-lg bg-blue-700 hover:bg-blue-800 text-white"
-            >
-              {submitting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Send className="w-3.5 h-3.5" />}
-              Kirim Pendaftaran Sidang
-            </button>
+      {/* Side-by-Side Registration Form & Realtime Document Preview */}
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+        <form
+          onSubmit={handleSubmit}
+          className="lg:col-span-5 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-6 space-y-4"
+        >
+          <div className="flex items-center justify-between gap-2">
+            <h2 className="text-sm font-semibold">Berkas Pendaftaran Sidang Akhir</h2>
+            {registration && <StatusBadge status={registration.status} />}
           </div>
-        )}
-      </form>
+
+          {fullThesisDoc && (
+            <SavedDocumentCard
+              label="Naskah Skripsi Tersimpan"
+              doc={fullThesisDoc}
+              isActivePreview={activePreviewSlot === 'full_thesis' && !thesisFile}
+              replacedByLocalFile={thesisFile}
+              onPreview={() => setActivePreviewSlot('full_thesis')}
+            />
+          )}
+
+          {canSubmit && (
+            <FileUploadField
+              label={
+                fullThesisDoc
+                  ? 'Ganti Naskah Skripsi Lengkap (PDF)'
+                  : 'Naskah Skripsi Lengkap / Full Thesis (PDF) *'
+              }
+              accept=".pdf"
+              maxMb={systemSettings?.max_upload_mb || 25}
+              selectedFile={thesisFile}
+              onSelectFile={handleSelectThesisFile}
+              helperText={
+                fullThesisDoc
+                  ? 'Berkas tersimpan tetap aman jika Anda tidak memilih file baru.'
+                  : undefined
+              }
+            />
+          )}
+
+          {supportingDoc && (
+            <SavedDocumentCard
+              label="Berkas Pendukung Tersimpan"
+              doc={supportingDoc}
+              isActivePreview={activePreviewSlot === 'supporting' && !supportingFile}
+              replacedByLocalFile={supportingFile}
+              onPreview={() => setActivePreviewSlot('supporting')}
+            />
+          )}
+
+          {canSubmit && (
+            <FileUploadField
+              label={
+                supportingDoc
+                  ? 'Ganti Berkas Pendukung Persyaratan Sidang (PDF/Gambar)'
+                  : 'Berkas Pendukung Persyaratan Sidang (PDF)'
+              }
+              accept=".pdf,.png,.jpg,.jpeg"
+              maxMb={systemSettings?.max_upload_mb || 25}
+              selectedFile={supportingFile}
+              onSelectFile={handleSelectSupportingFile}
+              helperText={
+                supportingDoc
+                  ? 'Berkas tersimpan tetap aman jika Anda tidak memilih file baru.'
+                  : undefined
+              }
+            />
+          )}
+
+          {!canSubmit && (
+            <p className="text-[11px] text-slate-500 dark:text-slate-400 rounded-lg bg-slate-50 dark:bg-slate-950/60 border border-slate-200 dark:border-slate-800 px-3 py-2">
+              Berkas pendaftaran sidang telah terkirim dan tersimpan permanen. Gunakan panel pratinjau di samping untuk meninjau atau mengunduh ulang berkas Anda.
+            </p>
+          )}
+
+          {canSubmit && (
+            <div className="flex justify-end pt-2">
+              <button
+                type="submit"
+                disabled={submitting}
+                className="inline-flex items-center gap-2 px-4 py-2 text-xs font-medium rounded-lg bg-blue-700 hover:bg-blue-800 text-white"
+              >
+                {submitting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Send className="w-3.5 h-3.5" />}
+                Kirim Pendaftaran Sidang
+              </button>
+            </div>
+          )}
+        </form>
+
+        <div className="lg:col-span-7">
+          <RealtimeDocumentPreviewPanel
+            title="Realtime Preview Berkas Sidang"
+            activeSlotId={activePreviewSlot}
+            onSelectSlot={(id) => setActivePreviewSlot(id as 'full_thesis' | 'supporting')}
+            slots={[
+              {
+                id: 'full_thesis',
+                label: 'Full Thesis (PDF)',
+                localFile: thesisFile,
+                savedDoc: fullThesisDoc,
+              },
+              {
+                id: 'supporting',
+                label: 'Berkas Pendukung',
+                localFile: supportingFile,
+                savedDoc: supportingDoc,
+              },
+            ]}
+          />
+        </div>
+      </div>
     </div>
   );
 }

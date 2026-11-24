@@ -1,8 +1,14 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { Download, Loader2, Printer, Save } from 'lucide-react';
+import { Download, Image as ImageIcon, Loader2, Printer, RotateCcw, Save, Upload } from 'lucide-react';
 import { DataTable, type ColumnDef } from '../../components/ui/DataTable';
 import { useAuth } from '../../contexts/AuthContext';
 import { useToast } from '../../contexts/ToastContext';
+import {
+  APP_ICON_PRESETS,
+  DEFAULT_APP_ICON_URL,
+  applyDocumentFavicon,
+  processImageFileToIconDataUrl,
+} from '../../lib/appIcons';
 import { logActivity, supabase } from '../../lib/supabase';
 import { exportToCsv, formatDateTime } from '../../lib/utils';
 import type { AcademicPeriod, ActivityLog, Program, SystemSettings } from '../../types/database';
@@ -405,6 +411,8 @@ export function SystemSettingsPage() {
   const [periods, setPeriods] = useState<AcademicPeriod[]>([]);
   const [formatsInput, setFormatsInput] = useState('pdf, docx, png, jpg');
   const [saving, setSaving] = useState(false);
+  const [processingIcon, setProcessingIcon] = useState(false);
+  const [iconPreviewError, setIconPreviewError] = useState(false);
 
   useEffect(() => {
     supabase.from('academic_periods').select('*').order('start_date', { ascending: false }).then(({ data }) => {
@@ -416,8 +424,51 @@ export function SystemSettingsPage() {
     if (systemSettings) {
       setForm(systemSettings);
       setFormatsInput((systemSettings.allowed_file_formats || ['pdf', 'docx']).join(', '));
+      setIconPreviewError(false);
     }
   }, [systemSettings]);
+
+  const handleIconFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file || !form) return;
+
+    const validMime = [
+      'image/png',
+      'image/jpeg',
+      'image/webp',
+      'image/svg+xml',
+      'image/x-icon',
+      'image/vnd.microsoft.icon',
+    ].includes(file.type);
+    const validExt = /\.(png|jpe?g|webp|svg|ico)$/i.test(file.name);
+
+    if (!validMime && !validExt) {
+      showToast('Format icon tidak didukung', 'warning', 'Pilih file PNG, JPG, WEBP, SVG, atau ICO dari perangkat Anda.');
+      return;
+    }
+
+    if (file.size > 5 * 1024 * 1024) {
+      showToast('Ukuran file terlalu besar', 'warning', 'Maksimal ukuran file gambar adalah 5 MB.');
+      return;
+    }
+
+    setProcessingIcon(true);
+    try {
+      const iconDataUrl = await processImageFileToIconDataUrl(file, 192);
+      setIconPreviewError(false);
+      setForm({ ...form, favicon_url: iconDataUrl });
+      showToast('Icon berhasil dimuat', 'success', 'Klik "Simpan Konfigurasi Sistem" untuk menerapkan ke seluruh aplikasi.');
+    } catch (err) {
+      showToast(
+        'Gagal memproses file icon',
+        'error',
+        err instanceof Error ? err.message : 'Pastikan file gambar valid.'
+      );
+    } finally {
+      setProcessingIcon(false);
+    }
+  };
 
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -456,6 +507,7 @@ export function SystemSettingsPage() {
       return;
     }
 
+    applyDocumentFavicon(form.favicon_url);
     await refreshSettings();
     await logActivity('update_system_settings', 'system_settings', form.id, { app_name: form.app_name });
     showToast('System settings berhasil diterapkan', 'success');
@@ -490,8 +542,130 @@ export function SystemSettingsPage() {
             <input type="text" value={form.logo_url || ''} onChange={(e) => setForm({ ...form, logo_url: e.target.value || null })} placeholder="/src/assets/images/..." className="w-full px-3 py-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950" />
           </div>
           <div>
-            <label className="block font-medium mb-1">Favicon URL (Opsional)</label>
-            <input type="text" value={form.favicon_url || ''} onChange={(e) => setForm({ ...form, favicon_url: e.target.value || null })} className="w-full px-3 py-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950" />
+            <label className="block font-medium mb-1.5">Icon / Favicon Aplikasi (Opsional)</label>
+            <div className="rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50/70 dark:bg-slate-950/60 p-3 space-y-3">
+              {/* Live Icon Preview + File/Media Picker */}
+              <div className="flex items-center gap-3">
+                <div className="w-12 h-12 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 flex items-center justify-center overflow-hidden shrink-0 shadow-xs">
+                  {!iconPreviewError ? (
+                    <img
+                      src={form.favicon_url || DEFAULT_APP_ICON_URL}
+                      alt="Preview Icon Aplikasi"
+                      referrerPolicy="no-referrer"
+                      onError={() => setIconPreviewError(true)}
+                      className="w-full h-full object-contain p-1"
+                    />
+                  ) : (
+                    <ImageIcon className="w-5 h-5 text-slate-400" />
+                  )}
+                </div>
+
+                <div className="min-w-0 flex-1 space-y-1.5">
+                  <div className="inline-flex items-center gap-1.5 px-2 py-1 rounded-md border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 max-w-full">
+                    {!iconPreviewError ? (
+                      <img
+                        src={form.favicon_url || DEFAULT_APP_ICON_URL}
+                        alt=""
+                        className="w-3.5 h-3.5 rounded-xs object-contain shrink-0"
+                      />
+                    ) : (
+                      <ImageIcon className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+                    )}
+                    <span className="text-[11px] font-medium text-slate-700 dark:text-slate-200 truncate">
+                      {form.app_name || 'TAFlow'} — Tab Browser
+                    </span>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <label className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md bg-blue-700 hover:bg-blue-800 text-white text-[11px] font-medium cursor-pointer transition-colors">
+                      {processingIcon ? (
+                        <Loader2 className="w-3 h-3 animate-spin" />
+                      ) : (
+                        <Upload className="w-3 h-3" />
+                      )}
+                      <span>{processingIcon ? 'Memproses...' : 'Pilih File / Media'}</span>
+                      <input
+                        type="file"
+                        accept="image/png,image/jpeg,image/webp,image/svg+xml,image/x-icon,.ico"
+                        className="hidden"
+                        onChange={handleIconFileSelect}
+                        disabled={processingIcon}
+                      />
+                    </label>
+                    {form.favicon_url && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setIconPreviewError(false);
+                          setForm({ ...form, favicon_url: null });
+                        }}
+                        className="inline-flex items-center gap-1 px-2 py-1.5 rounded-md border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-[11px] text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
+                      >
+                        <RotateCcw className="w-3 h-3" />
+                        <span>Reset</span>
+                      </button>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              {/* Built-in Custom TAFlow Icons */}
+              <div>
+                <p className="text-[11px] text-slate-500 dark:text-slate-400 mb-1.5">
+                  Atau pilih icon bawaan TAFlow:
+                </p>
+                <div className="grid grid-cols-4 gap-2">
+                  {APP_ICON_PRESETS.map((preset) => {
+                    const isSelected =
+                      form.favicon_url === preset.dataUrl ||
+                      (!form.favicon_url && preset.dataUrl === DEFAULT_APP_ICON_URL);
+                    return (
+                      <button
+                        key={preset.id}
+                        type="button"
+                        title={preset.label}
+                        onClick={() => {
+                          setIconPreviewError(false);
+                          setForm({ ...form, favicon_url: preset.dataUrl });
+                        }}
+                        className={`flex flex-col items-center gap-1 p-1.5 rounded-lg border transition-colors ${
+                          isSelected
+                            ? 'border-blue-600 bg-blue-50/80 dark:bg-blue-950/40 dark:border-cyan-400'
+                            : 'border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 hover:border-slate-300 dark:hover:border-slate-600'
+                        }`}
+                      >
+                        <img
+                          src={preset.dataUrl}
+                          alt={preset.label}
+                          className="w-7 h-7 rounded-md object-contain"
+                        />
+                        <span className="text-[10px] text-slate-600 dark:text-slate-300 truncate w-full text-center">
+                          {preset.label}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Manual URL Input */}
+              <div>
+                <input
+                  type="text"
+                  value={form.favicon_url?.startsWith('data:') ? '' : form.favicon_url || ''}
+                  onChange={(e) => {
+                    setIconPreviewError(false);
+                    setForm({ ...form, favicon_url: e.target.value || null });
+                  }}
+                  placeholder={
+                    form.favicon_url?.startsWith('data:')
+                      ? 'Icon lokal/preset aktif (tempel URL jika ingin mengganti)'
+                      : 'Atau masukkan URL icon (https://...)'
+                  }
+                  className="w-full px-3 py-1.5 rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-[11px]"
+                />
+              </div>
+            </div>
           </div>
           <div>
             <label className="block font-medium mb-1">Maksimal Pembimbing</label>

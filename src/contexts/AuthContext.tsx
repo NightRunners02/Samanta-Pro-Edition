@@ -1,5 +1,6 @@
 import React, { createContext, useCallback, useContext, useEffect, useState } from 'react';
 import type { Session, User } from '@supabase/supabase-js';
+import { applyDocumentFavicon } from '../lib/appIcons';
 import { formatSupabaseError, getSignedDocumentUrl, isSchemaMissingError, logActivity, supabase } from '../lib/supabase';
 import type { AcademicPeriod, Profile, SystemSettings } from '../types/database';
 
@@ -65,6 +66,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       if (settingsData.app_name) {
         document.title = `${settingsData.app_name} — Academic Thesis Management Platform`;
       }
+      applyDocumentFavicon(settingsData.favicon_url);
       if (settingsData.active_period_id) {
         const { data: periodData } = await supabase
           .from('academic_periods')
@@ -193,6 +195,28 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       supabase.removeChannel(channel);
     };
   }, [user?.id, fetchProfile]);
+
+  // Real-time listener on system_settings for instant icon, name, and config updates
+  useEffect(() => {
+    const channel = supabase
+      .channel('system_settings_realtime')
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'system_settings',
+        },
+        () => {
+          fetchSettings();
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [fetchSettings]);
 
   const refreshProfile = useCallback(async () => {
     if (user?.id) {
