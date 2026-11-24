@@ -514,6 +514,7 @@ CREATE TABLE IF NOT EXISTS public.system_settings (
   scoring_weights JSONB NOT NULL DEFAULT '{"presentation": 15, "substance": 25, "methodology": 20, "results": 20, "mastery": 15, "revision": 5}'::jsonb,
   email_config JSONB NOT NULL DEFAULT '{"sender_name": "TAFlow Academic", "sender_email": "noreply@taflow.ac.id", "smtp_enabled": false}'::jsonb,
   notification_settings JSONB NOT NULL DEFAULT '{"notify_on_submission": true, "notify_on_schedule": true, "notify_on_grade": true}'::jsonb,
+  certificate_config JSONB NOT NULL DEFAULT '{"template_style": "academic_navy", "university_name": "TAFlow Academic University", "university_subtitle": "Terakreditasi Institusi · Layanan Akademik Terintegrasi", "city": "Indonesia", "certificate_title": "SERTIFIKAT KELULUSAN TUGAS AKHIR", "number_format": "{SEQ}/SERT-TA/{PRODI}/{YEAR}", "signatory_name": "", "signatory_title": "", "signatory_nip": "", "logo_url": null, "signature_image_url": null, "stamp_image_url": null, "show_official_stamp": true, "default_issue_mode": "graduation_date"}'::jsonb,
   maintenance_mode BOOLEAN NOT NULL DEFAULT FALSE,
   updated_by UUID REFERENCES public.profiles(id) ON DELETE SET NULL,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -521,7 +522,8 @@ CREATE TABLE IF NOT EXISTS public.system_settings (
 
 ALTER TABLE public.system_settings
   ADD COLUMN IF NOT EXISTS logo_url TEXT,
-  ADD COLUMN IF NOT EXISTS favicon_url TEXT;
+  ADD COLUMN IF NOT EXISTS favicon_url TEXT,
+  ADD COLUMN IF NOT EXISTS certificate_config JSONB NOT NULL DEFAULT '{"template_style": "academic_navy", "university_name": "TAFlow Academic University", "university_subtitle": "Terakreditasi Institusi · Layanan Akademik Terintegrasi", "city": "Indonesia", "certificate_title": "SERTIFIKAT KELULUSAN TUGAS AKHIR", "number_format": "{SEQ}/SERT-TA/{PRODI}/{YEAR}", "signatory_name": "", "signatory_title": "", "signatory_nip": "", "logo_url": null, "signature_image_url": null, "stamp_image_url": null, "show_official_stamp": true, "default_issue_mode": "graduation_date"}'::jsonb;
 
 -- 23. official_decrees (SK Pembimbing & SK Penguji with Version History)
 CREATE TABLE IF NOT EXISTS public.official_decrees (
@@ -555,6 +557,34 @@ CREATE TABLE IF NOT EXISTS public.official_decrees (
 CREATE INDEX IF NOT EXISTS idx_official_decrees_student ON public.official_decrees(student_id, decree_type, is_latest);
 CREATE INDEX IF NOT EXISTS idx_official_decrees_thesis ON public.official_decrees(thesis_id, decree_type, version_number DESC);
 
+-- 24. graduation_certificates (Sertifikat Kelulusan Tugas Akhir with QR Verification & Version History)
+CREATE TABLE IF NOT EXISTS public.graduation_certificates (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  student_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+  thesis_submission_id UUID NOT NULL REFERENCES public.thesis_submissions(id) ON DELETE CASCADE,
+  graduation_record_id UUID NOT NULL REFERENCES public.graduation_records(id) ON DELETE CASCADE,
+  certificate_number TEXT NOT NULL UNIQUE,
+  certificate_type TEXT NOT NULL DEFAULT 'Sertifikat Kelulusan Tugas Akhir',
+  issue_date DATE NOT NULL DEFAULT CURRENT_DATE,
+  graduation_date DATE NOT NULL,
+  certificate_status TEXT NOT NULL DEFAULT 'valid' CHECK (certificate_status IN ('valid', 'revoked')),
+  pdf_storage_path TEXT NOT NULL,
+  verification_code TEXT NOT NULL UNIQUE,
+  version INTEGER NOT NULL DEFAULT 1 CHECK (version >= 1),
+  is_latest BOOLEAN NOT NULL DEFAULT TRUE,
+  issued_by UUID REFERENCES public.profiles(id) ON DELETE SET NULL,
+  revoked_at TIMESTAMPTZ,
+  revocation_reason TEXT,
+  certificate_metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (graduation_record_id, version)
+);
+
+CREATE INDEX IF NOT EXISTS idx_grad_certs_student ON public.graduation_certificates(student_id, is_latest, version DESC);
+CREATE INDEX IF NOT EXISTS idx_grad_certs_record ON public.graduation_certificates(graduation_record_id, version DESC);
+CREATE INDEX IF NOT EXISTS idx_grad_certs_verify ON public.graduation_certificates(verification_code);
+
 -- Attach updated_at triggers
 DO $$
 DECLARE
@@ -564,7 +594,8 @@ BEGIN
     'departments', 'programs', 'academic_periods', 'profiles', 'submission_requirements',
     'thesis_submissions', 'thesis_documents', 'thesis_progress', 'supervision_sessions',
     'seminar_registrations', 'defense_registrations', 'exam_schedules', 'exam_scores',
-    'plagiarism_checks', 'graduation_records', 'system_settings', 'official_decrees'
+    'plagiarism_checks', 'graduation_records', 'system_settings', 'official_decrees',
+    'graduation_certificates'
   ]
   LOOP
     EXECUTE format('DROP TRIGGER IF EXISTS trg_%I_updated_at ON public.%I;', tbl, tbl);
@@ -1546,6 +1577,90 @@ $$;
 
 GRANT EXECUTE ON FUNCTION public.check_exam_schedule_conflicts(DATE, TIME, TIME, TEXT, UUID, UUID[], UUID) TO authenticated;
 
+-- Public-safe Certificate QR Verification RPC (exposes ONLY fields required to validate authenticity)
+CREATE OR REPLACE FUNCTION public.verify_graduation_certificate(p_code TEXT)
+RETURNS TABLE (
+  certificate_number TEXT,
+  certificate_type TEXT,
+  student_name TEXT,
+  student_nim TEXT,
+  program_name TEXT,
+  thesis_title TEXT,
+  graduation_date DATE,
+  issue_date DATE,
+  certificate_status TEXT,
+  verification_code TEXT,
+  version INTEGER,
+  revoked_at TIMESTAMPTZ,
+  revocation_reason TEXT,
+  university_name TEXT,
+  faculty_name TEXT
+)
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  SELECT
+    gc.certificate_number,
+    gc.certificate_type,
+    COALESCE(NULLIF(gc.certificate_metadata->>'student_name', ''), p.full_name) AS student_name,
+    COALESCE(NULLIF(gc.certificate_metadata->>'student_nim', ''), p.nim_nip, '-') AS student_nim,
+    COALESCE(
+      NULLIF(gc.certificate_metadata->>'program_name', ''),
+      CONCAT_WS(' ', prog.degree_level, prog.name),
+      'Program Studi'
+    ) AS program_name,
+    COALESCE(NULLIF(gc.certificate_metadata->>'thesis_title', ''), ts.title) AS thesis_title,
+    gc.graduation_date,
+    gc.issue_date,
+    gc.certificate_status,
+    gc.verification_code,
+    gc.version,
+    gc.revoked_at,
+    gc.revocation_reason,
+    COALESCE(NULLIF(gc.certificate_metadata->>'university_name', ''), 'TAFlow Academic') AS university_name,
+    COALESCE(NULLIF(gc.certificate_metadata->>'faculty_name', ''), dept.name, 'Fakultas') AS faculty_name
+  FROM public.graduation_certificates gc
+  JOIN public.profiles p ON p.id = gc.student_id
+  JOIN public.thesis_submissions ts ON ts.id = gc.thesis_submission_id
+  LEFT JOIN public.programs prog ON prog.id = COALESCE(ts.program_id, p.program_id)
+  LEFT JOIN public.departments dept ON dept.id = COALESCE(prog.department_id, p.department_id)
+  WHERE UPPER(TRIM(gc.verification_code)) = UPPER(TRIM(p_code))
+     OR UPPER(TRIM(gc.certificate_number)) = UPPER(TRIM(p_code))
+  ORDER BY gc.version DESC
+  LIMIT 1;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.verify_graduation_certificate(TEXT) TO anon, authenticated;
+
+-- Admin-only Certificate Template & Signatory Settings RPC
+CREATE OR REPLACE FUNCTION public.save_certificate_config(p_config JSONB)
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_caller_role TEXT;
+  v_updated JSONB;
+BEGIN
+  v_caller_role := public.current_user_role();
+  IF v_caller_role NOT IN ('super_admin', 'program_admin') THEN
+    RAISE EXCEPTION 'Unauthorized: hanya administrator yang dapat mengubah pengaturan sertifikat.';
+  END IF;
+
+  UPDATE public.system_settings
+  SET certificate_config = COALESCE(certificate_config, '{}'::jsonb) || COALESCE(p_config, '{}'::jsonb),
+      updated_by = auth.uid()
+  RETURNING certificate_config INTO v_updated;
+
+  RETURN v_updated;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.save_certificate_config(JSONB) TO authenticated;
+
 -- ============================================================================
 -- SECTION 6: ROW LEVEL SECURITY (RLS) ON ALL 22 TABLES (IDEMPOTENT)
 -- ============================================================================
@@ -1963,6 +2078,31 @@ CREATE POLICY "official_decrees_delete_admin" ON public.official_decrees FOR DEL
   public.is_program_admin()
 );
 
+-- Graduation Certificates RLS (Students strictly read own; ONLY Admin inserts, updates, revokes, or deletes)
+ALTER TABLE public.graduation_certificates ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "graduation_certificates_select" ON public.graduation_certificates;
+CREATE POLICY "graduation_certificates_select" ON public.graduation_certificates FOR SELECT USING (
+  student_id = auth.uid() OR public.is_program_admin()
+);
+
+DROP POLICY IF EXISTS "graduation_certificates_insert_admin" ON public.graduation_certificates;
+CREATE POLICY "graduation_certificates_insert_admin" ON public.graduation_certificates FOR INSERT WITH CHECK (
+  public.is_program_admin()
+);
+
+DROP POLICY IF EXISTS "graduation_certificates_update_admin" ON public.graduation_certificates;
+CREATE POLICY "graduation_certificates_update_admin" ON public.graduation_certificates FOR UPDATE USING (
+  public.is_program_admin()
+) WITH CHECK (
+  public.is_program_admin()
+);
+
+DROP POLICY IF EXISTS "graduation_certificates_delete_admin" ON public.graduation_certificates;
+CREATE POLICY "graduation_certificates_delete_admin" ON public.graduation_certificates FOR DELETE USING (
+  public.is_program_admin()
+);
+
 -- ============================================================================
 -- SECTION 6B: POSTGRESQL TABLE, SCHEMA & SEQUENCE GRANTS (REQUIRED FOR SUPABASE)
 -- ============================================================================
@@ -2002,7 +2142,8 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON
   public.plagiarism_checks,
   public.graduation_records,
   public.notifications,
-  public.official_decrees
+  public.official_decrees,
+  public.graduation_certificates
 TO authenticated;
 
 -- Activity logs remain immutable (append-only for authenticated)
@@ -2025,7 +2166,8 @@ VALUES
   ('defense-documents', 'defense-documents', FALSE),
   ('plagiarism-documents', 'plagiarism-documents', FALSE),
   ('graduation-documents', 'graduation-documents', FALSE),
-  ('official-decrees', 'official-decrees', FALSE)
+  ('official-decrees', 'official-decrees', FALSE),
+  ('graduation-certificates', 'graduation-certificates', FALSE)
 ON CONFLICT (id) DO NOTHING;
 
 DROP POLICY IF EXISTS "storage_authenticated_upload" ON storage.objects;
@@ -2033,14 +2175,20 @@ CREATE POLICY "storage_authenticated_upload"
 ON storage.objects FOR INSERT
 TO authenticated
 WITH CHECK (
-  bucket_id IN (
-    'avatars', 'thesis-documents', 'thesis-proposals',
-    'seminar-documents', 'defense-documents', 'plagiarism-documents', 'graduation-documents',
-    'official-decrees'
+  (
+    bucket_id = 'graduation-certificates'
+    AND public.is_program_admin()
   )
-  AND (
-    (storage.foldername(name))[1] = auth.uid()::text
-    OR public.is_program_admin()
+  OR (
+    bucket_id IN (
+      'avatars', 'thesis-documents', 'thesis-proposals',
+      'seminar-documents', 'defense-documents', 'plagiarism-documents', 'graduation-documents',
+      'official-decrees'
+    )
+    AND (
+      (storage.foldername(name))[1] = auth.uid()::text
+      OR public.is_program_admin()
+    )
   )
 );
 
@@ -2050,7 +2198,7 @@ ON storage.objects FOR SELECT
 TO authenticated
 USING (
   (
-    bucket_id = 'official-decrees'
+    bucket_id IN ('official-decrees', 'graduation-certificates')
     AND (
       (storage.foldername(name))[1] = auth.uid()::text
       OR public.is_program_admin()
@@ -2076,11 +2224,11 @@ ON storage.objects FOR UPDATE
 TO authenticated
 USING (
   (
-    bucket_id = 'official-decrees'
+    bucket_id IN ('official-decrees', 'graduation-certificates')
     AND public.is_program_admin()
   )
   OR (
-    bucket_id <> 'official-decrees'
+    bucket_id NOT IN ('official-decrees', 'graduation-certificates')
     AND (
       (storage.foldername(name))[1] = auth.uid()::text
       OR public.is_program_admin()
@@ -2094,11 +2242,11 @@ ON storage.objects FOR DELETE
 TO authenticated
 USING (
   (
-    bucket_id = 'official-decrees'
+    bucket_id IN ('official-decrees', 'graduation-certificates')
     AND public.is_program_admin()
   )
   OR (
-    bucket_id <> 'official-decrees'
+    bucket_id NOT IN ('official-decrees', 'graduation-certificates')
     AND (
       (storage.foldername(name))[1] = auth.uid()::text
       OR public.is_program_admin()
@@ -2135,7 +2283,8 @@ BEGIN
     'graduation_records',
     'notifications',
     'system_settings',
-    'official_decrees'
+    'official_decrees',
+    'graduation_certificates'
   ]
   LOOP
     BEGIN

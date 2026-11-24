@@ -56,7 +56,7 @@ export function DatabaseSetupView({ onRetry }: DatabaseSetupViewProps) {
               <ol className="list-decimal list-inside space-y-0.5">
                 <li>Salin skrip SQL lengkap <code className="font-mono">0004_taflow_complete.sql</code> di bawah ini.</li>
                 <li>Buka <strong>Supabase Dashboard &rarr; SQL Editor &rarr; New Query</strong> pada proyek Anda.</li>
-                <li>Tempel skrip SQL dan klik <strong>Run</strong> untuk membuat 22 tabel, RLS policies, fungsi RPC, trigger auth, private storage buckets, dan realtime.</li>
+                <li>Tempel skrip SQL dan klik <strong>Run</strong> untuk membuat 24 tabel, RLS policies, fungsi RPC, trigger auth, private storage buckets, dan realtime.</li>
                 <li>Kembali ke halaman ini lalu klik <strong>Verifikasi Koneksi Database</strong>.</li>
               </ol>
             </div>
@@ -66,7 +66,7 @@ export function DatabaseSetupView({ onRetry }: DatabaseSetupViewProps) {
             <div className="inline-flex items-center gap-2 px-3 py-1.5 bg-slate-100 dark:bg-slate-800 rounded-lg text-xs font-mono font-medium text-slate-700 dark:text-slate-300">
               <span>supabase/migrations/0004_taflow_complete.sql</span>
               <span className="text-slate-400 dark:text-slate-500">•</span>
-              <span>22 Tabel + RLS + RPC + Storage + Seed</span>
+              <span>24 Tabel + RLS + RPC + Storage + Seed</span>
             </div>
 
             <button

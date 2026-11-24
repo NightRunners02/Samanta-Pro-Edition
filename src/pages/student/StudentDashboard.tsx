@@ -20,6 +20,7 @@ import {
   XAxis,
   YAxis,
 } from 'recharts';
+import { GraduationCertificateSection } from '../../components/student/GraduationCertificateSection';
 import { SupportingDecreesSection } from '../../components/student/SupportingDecreesSection';
 import { CardGridSkeleton } from '../../components/ui/Skeleton';
 import { StatusBadge } from '../../components/ui/StatusBadge';
@@ -39,6 +40,7 @@ import type {
   ExamSchedule,
   ExamScore,
   ExaminerAssignment,
+  GraduationCertificate,
   GraduationRecord,
   OfficialDecree,
   PlagiarismCheck,
@@ -75,6 +77,7 @@ export function StudentDashboard({ onNavigate }: StudentDashboardProps) {
   const [scores, setScores] = useState<ExamScore[]>([]);
   const [plagiarism, setPlagiarism] = useState<PlagiarismCheck | null>(null);
   const [graduation, setGraduation] = useState<GraduationRecord | null>(null);
+  const [certificates, setCertificates] = useState<GraduationCertificate[]>([]);
   const [decrees, setDecrees] = useState<OfficialDecree[]>([]);
   const [defenseExaminers, setDefenseExaminers] = useState<ExaminerAssignment[]>([]);
   const [generatingDecreeType, setGeneratingDecreeType] = useState<DecreeType | null>(null);
@@ -134,6 +137,7 @@ export function StudentDashboard({ onNavigate }: StudentDashboardProps) {
         { data: scoreData },
         { data: plagData },
         { data: gradData },
+        { data: certData },
         { data: decreeData },
         { data: examinerData },
       ] = await Promise.all([
@@ -182,6 +186,11 @@ export function StudentDashboard({ onNavigate }: StudentDashboardProps) {
           .limit(1)
           .maybeSingle(),
         supabase
+          .from('graduation_certificates')
+          .select('*')
+          .eq('student_id', profile.id)
+          .order('version', { ascending: false }),
+        supabase
           .from('official_decrees')
           .select('*')
           .eq('thesis_id', currentThesis.id)
@@ -200,9 +209,11 @@ export function StudentDashboard({ onNavigate }: StudentDashboardProps) {
       setScores((scoreData || []) as ExamScore[]);
       setPlagiarism((plagData as PlagiarismCheck) || null);
       setGraduation((gradData as GraduationRecord) || null);
+      setCertificates((certData || []) as GraduationCertificate[]);
       setDecrees((decreeData || []) as OfficialDecree[]);
       setDefenseExaminers((examinerData || []) as ExaminerAssignment[]);
     } else {
+      setCertificates([]);
       setDecrees([]);
       setDefenseExaminers([]);
     }
@@ -227,6 +238,7 @@ export function StudentDashboard({ onNavigate }: StudentDashboardProps) {
       .on('postgres_changes', { event: '*', schema: 'public', table: 'exam_scores' }, loadAll)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'plagiarism_checks', filter: `student_id=eq.${profile.id}` }, loadAll)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'graduation_records', filter: `student_id=eq.${profile.id}` }, loadAll)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'graduation_certificates', filter: `student_id=eq.${profile.id}` }, loadAll)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'official_decrees', filter: `student_id=eq.${profile.id}` }, loadAll)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'notifications', filter: `user_id=eq.${profile.id}` }, loadAll)
       .subscribe();
@@ -639,6 +651,14 @@ export function StudentDashboard({ onNavigate }: StudentDashboardProps) {
         supervisorEligible={supervisorDecreeEligible}
         examinerEligible={examinerDecreeEligible}
         generatingType={generatingDecreeType}
+      />
+
+      {/* Sertifikat Kelulusan */}
+      <GraduationCertificateSection
+        profile={profile}
+        thesis={thesis}
+        graduation={graduation}
+        certificates={certificates}
       />
 
       {/* Chart + Recent Notifications & Activity */}

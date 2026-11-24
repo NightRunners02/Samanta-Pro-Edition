@@ -59,13 +59,35 @@ import {
 } from './pages/admin/ReportsAndAuditPages';
 
 // Shared Pages
+import { CertificateVerificationPage } from './pages/shared/CertificateVerificationPage';
 import { NotificationsPage } from './pages/shared/NotificationsPage';
 import { ProfileSettingsPage } from './pages/shared/ProfileSettingsPage';
 import { Loader2 } from 'lucide-react';
 
+function extractVerificationCodeFromLocation(): string | null {
+  if (typeof window === 'undefined') return null;
+  const params = new URLSearchParams(window.location.search);
+  const queryCode = params.get('verify_cert') || params.get('verify');
+  if (queryCode && queryCode.trim()) {
+    return queryCode.trim();
+  }
+  const match = window.location.pathname.match(/^\/(?:verify|verify-certificate)\/([^/?#]+)/i);
+  if (match?.[1]) {
+    return decodeURIComponent(match[1]);
+  }
+  return null;
+}
+
 function TAFlowRouter() {
   const { user, profile, loading, schemaMissing, isPasswordRecovery, refreshSettings } = useAuth();
   const [activePage, setActivePage] = useState<string>('dashboard');
+  const [verifyCode, setVerifyCode] = useState<string | null>(() => extractVerificationCodeFromLocation());
+
+  useEffect(() => {
+    const onPopState = () => setVerifyCode(extractVerificationCodeFromLocation());
+    window.addEventListener('popstate', onPopState);
+    return () => window.removeEventListener('popstate', onPopState);
+  }, []);
 
   const role = profile?.role_code || 'student';
 
@@ -79,6 +101,24 @@ function TAFlowRouter() {
 
   if (schemaMissing) {
     return <DatabaseSetupView onRetry={refreshSettings} />;
+  }
+
+  if (verifyCode) {
+    return (
+      <CertificateVerificationPage
+        initialCode={verifyCode}
+        onExit={() => {
+          const url = new URL(window.location.href);
+          url.searchParams.delete('verify_cert');
+          url.searchParams.delete('verify');
+          if (/^\/(?:verify|verify-certificate)/i.test(url.pathname)) {
+            url.pathname = '/';
+          }
+          window.history.replaceState({}, '', url.toString());
+          setVerifyCode(null);
+        }}
+      />
+    );
   }
 
   if (loading) {

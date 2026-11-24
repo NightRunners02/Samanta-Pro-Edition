@@ -493,6 +493,7 @@ export interface SystemSettings {
     notify_on_schedule: boolean;
     notify_on_grade: boolean;
   };
+  certificate_config?: CertificateConfig | null;
   maintenance_mode: boolean;
   updated_at: string;
 }
@@ -564,4 +565,92 @@ export interface OfficialDecree {
   created_at: string;
   updated_at: string;
 }
+
+export type CertificateTemplateStyle = 'academic_navy' | 'classic_gold' | 'modern_minimal';
+
+export type CertificateStatus = 'valid' | 'revoked';
+
+export interface CertificateConfig {
+  template_style: CertificateTemplateStyle;
+  university_name: string;
+  university_subtitle: string;
+  city: string;
+  certificate_title: string;
+  number_format: string;
+  signatory_name: string;
+  signatory_title: string;
+  signatory_nip: string;
+  logo_url: string | null;
+  signature_image_url: string | null;
+  stamp_image_url: string | null;
+  show_official_stamp: boolean;
+  default_issue_mode: 'graduation_date' | 'today';
+}
+
+export interface GraduationCertificateMetadata {
+  template_style: CertificateTemplateStyle;
+  university_name: string;
+  university_subtitle: string;
+  city: string;
+  faculty_name: string;
+  faculty_code?: string;
+  program_name: string;
+  program_code?: string;
+  student_name: string;
+  student_nim: string;
+  thesis_title: string;
+  yudisium_period?: string | null;
+  final_score?: number | null;
+  final_grade?: string | null;
+  signatory_name: string;
+  signatory_title: string;
+  signatory_nip?: string | null;
+  show_official_stamp: boolean;
+  reissue_reason?: string | null;
+}
+
+export interface GraduationCertificate {
+  id: string;
+  student_id: string;
+  thesis_submission_id: string;
+  graduation_record_id: string;
+  certificate_number: string;
+  certificate_type: string;
+  issue_date: string;
+  graduation_date: string;
+  certificate_status: CertificateStatus;
+  pdf_storage_path: string;
+  verification_code: string;
+  version: number;
+  is_latest: boolean;
+  issued_by: string | null;
+  revoked_at: string | null;
+  revocation_reason: string | null;
+  certificate_metadata: GraduationCertificateMetadata;
+  created_at: string;
+  updated_at: string;
+  student?: Profile;
+  thesis_submission?: ThesisSubmission;
+  graduation_record?: GraduationRecord;
+  issuer?: Profile | null;
+}
+
+export interface CertificateVerificationResult {
+  certificate_number: string;
+  certificate_type: string;
+  student_name: string;
+  student_nim: string;
+  program_name: string;
+  thesis_title: string;
+  graduation_date: string;
+  issue_date: string;
+  certificate_status: CertificateStatus;
+  verification_code: string;
+  version: number;
+  revoked_at: string | null;
+  revocation_reason: string | null;
+  university_name: string;
+  faculty_name: string;
+}
+
 
