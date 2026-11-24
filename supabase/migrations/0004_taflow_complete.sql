@@ -1643,6 +1643,7 @@ SET search_path = public
 AS $$
 DECLARE
   v_caller_role TEXT;
+  v_settings_id UUID;
   v_updated JSONB;
 BEGIN
   v_caller_role := public.current_user_role();
@@ -1650,10 +1651,22 @@ BEGIN
     RAISE EXCEPTION 'Unauthorized: hanya administrator yang dapat mengubah pengaturan sertifikat.';
   END IF;
 
-  UPDATE public.system_settings
-  SET certificate_config = COALESCE(certificate_config, '{}'::jsonb) || COALESCE(p_config, '{}'::jsonb),
-      updated_by = auth.uid()
-  RETURNING certificate_config INTO v_updated;
+  SELECT id INTO v_settings_id
+  FROM public.system_settings
+  ORDER BY updated_at DESC NULLS LAST
+  LIMIT 1;
+
+  IF v_settings_id IS NULL THEN
+    INSERT INTO public.system_settings (certificate_config, updated_by)
+    VALUES (COALESCE(p_config, '{}'::jsonb), auth.uid())
+    RETURNING certificate_config INTO v_updated;
+  ELSE
+    UPDATE public.system_settings
+    SET certificate_config = COALESCE(certificate_config, '{}'::jsonb) || COALESCE(p_config, '{}'::jsonb),
+        updated_by = auth.uid()
+    WHERE id = v_settings_id
+    RETURNING certificate_config INTO v_updated;
+  END IF;
 
   RETURN v_updated;
 END;

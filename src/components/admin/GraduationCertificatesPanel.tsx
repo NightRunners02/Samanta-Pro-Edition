@@ -280,9 +280,25 @@ export function GraduationCertificatesPanel({
   const handleSaveConfig = async (e: React.FormEvent) => {
     e.preventDefault();
     setSavingConfig(true);
-    const { error } = await supabase.rpc('save_certificate_config', {
+    let { error } = await supabase.rpc('save_certificate_config', {
       p_config: certConfig,
     });
+
+    if (error && error.message?.includes('WHERE clause') && systemSettings?.id) {
+      const mergedConfig = {
+        ...(systemSettings.certificate_config || {}),
+        ...certConfig,
+      };
+      const directRes = await supabase
+        .from('system_settings')
+        .update({
+          certificate_config: mergedConfig,
+          updated_by: profile?.id || null,
+        })
+        .eq('id', systemSettings.id);
+      error = directRes.error;
+    }
+
     setSavingConfig(false);
 
     if (error) {
