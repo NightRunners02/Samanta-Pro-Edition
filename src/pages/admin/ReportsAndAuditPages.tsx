@@ -1,47 +1,58 @@
-import React, { useCallback, useEffect, useState } from 'react';
-import { Download, Image as ImageIcon, Loader2, Printer, RotateCcw, Save, Upload } from 'lucide-react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  Download,
+  Eye,
+  FileDown,
+  Image as ImageIcon,
+  Loader2,
+  Printer,
+  RotateCcw,
+  Save,
+  Search,
+  Upload,
+} from 'lucide-react';
 import { DataTable, type ColumnDef } from '../../components/ui/DataTable';
+import { Modal } from '../../components/ui/Modal';
 import { useAuth } from '../../contexts/AuthContext';
 import { useToast } from '../../contexts/ToastContext';
+import {
+  fetchAcademicReportData,
+  type AcademicReportDataset,
+} from '../../lib/academicReportData';
+import {
+  generateAcademicReportPdf,
+  REPORT_TYPES,
+  type ReportType,
+} from '../../lib/academicReportPdf';
 import {
   APP_ICON_PRESETS,
   DEFAULT_APP_ICON_URL,
   applyDocumentFavicon,
   processImageFileToIconDataUrl,
 } from '../../lib/appIcons';
+import { formatLecturerAcademicName } from '../../lib/decreeService';
 import { logActivity, supabase } from '../../lib/supabase';
-import { exportToCsv, formatDateTime } from '../../lib/utils';
+import { exportToCsv, formatDate, formatDateTime, formatRoleLabel } from '../../lib/utils';
 import type { AcademicPeriod, ActivityLog, Program, SystemSettings } from '../../types/database';
 
-type ReportType =
-  | 'submissions'
-  | 'supervisees'
-  | 'progress'
-  | 'seminars'
-  | 'defenses'
-  | 'scores'
-  | 'plagiarism'
-  | 'yudisium'
-  | 'graduations'
-  | 'delayed';
-
-const REPORT_TYPES: Array<{ id: ReportType; label: string }> = [
-  { id: 'submissions', label: '1. Laporan Pengajuan TA' },
-  { id: 'supervisees', label: '2. Laporan Mahasiswa Bimbingan' },
-  { id: 'progress', label: '3. Laporan Progres TA' },
-  { id: 'seminars', label: '4. Laporan Seminar Proposal' },
-  { id: 'defenses', label: '5. Laporan Sidang Akhir' },
-  { id: 'scores', label: '6. Laporan Nilai Sidang' },
-  { id: 'plagiarism', label: '7. Laporan Plagiasi' },
-  { id: 'yudisium', label: '8. Laporan Yudisium' },
-  { id: 'graduations', label: '9. Laporan Kelulusan' },
-  { id: 'delayed', label: '10. Laporan Mahasiswa Terlambat' },
-];
+function stripInternalFields(rows: Array<Record<string, string | number>>) {
+  return rows.map((row) => {
+    const clean: Record<string, string | number> = {};
+    for (const [key, val] of Object.entries(row)) {
+      if (key === 'id' || key.startsWith('_')) continue;
+      clean[key] = val;
+    }
+    return clean;
+  });
+}
 
 // ==========================================
 // 1. Academic Reports Page
 // ==========================================
 export function ReportsPage() {
+  const { profile, systemSettings, activePeriod } = useAuth();
+  const { showToast } = useToast();
+
   const [reportType, setReportType] = useState<ReportType>('submissions');
   const [programs, setPrograms] = useState<Program[]>([]);
   const [periods, setPeriods] = useState<AcademicPeriod[]>([]);
@@ -50,13 +61,27 @@ export function ReportsPage() {
   const [statusFilter, setStatusFilter] = useState('all');
   const [dateFrom, setDateFrom] = useState('');
   const [dateTo, setDateTo] = useState('');
+  const [searchQuery, setSearchQuery] = useState('');
 
   const [loading, setLoading] = useState(true);
-  const [rows, setRows] = useState<Array<Record<string, string | number>>>([]);
+  const [dataset, setDataset] = useState<AcademicReportDataset>({
+    rows: [],
+    stats: [],
+    title: 'Laporan Pengajuan Judul Tugas Akhir',
+    subtitle: '',
+    availableStatuses: [],
+  });
+
+  const [pdfBusy, setPdfBusy] = useState<'preview' | 'download' | 'print' | null>(null);
+  const [previewOpen, setPreviewOpen] = useState(false);
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const [previewFilename, setPreviewFilename] = useState('taflow_laporan.pdf');
+  const printIframeRef = useRef<HTMLIFrameElement | null>(null);
+  const [printBlobUrl, setPrintBlobUrl] = useState<string | null>(null);
 
   useEffect(() => {
     Promise.all([
-      supabase.from('programs').select('*').order('name'),
+      supabase.from('programs').select('*, department:departments(*)').order('name'),
       supabase.from('academic_periods').select('*').order('start_date', { ascending: false }),
     ]).then(([{ data: pData }, { data: perData }]) => {
       setPrograms((pData || []) as Program[]);
@@ -64,151 +89,29 @@ export function ReportsPage() {
     });
   }, []);
 
+  useEffect(() => {
+    return () => {
+      if (previewUrl) URL.revokeObjectURL(previewUrl);
+    };
+  }, [previewUrl]);
+
+  useEffect(() => {
+    return () => {
+      if (printBlobUrl) URL.revokeObjectURL(printBlobUrl);
+    };
+  }, [printBlobUrl]);
+
   const fetchReport = useCallback(async () => {
     setLoading(true);
-    let result: Array<Record<string, string | number>> = [];
-
-    if (reportType === 'submissions' || reportType === 'progress' || reportType === 'delayed') {
-      const { data } = await supabase
-        .from('thesis_submissions')
-        .select('*, student:profiles!thesis_submissions_student_id_fkey(*), program:programs(*)')
-        .order('created_at', { ascending: false });
-
-      const now = Date.now();
-      result = (data || [])
-        .filter((d) => (programFilter === 'all' ? true : d.program_id === programFilter))
-        .filter((d) => (periodFilter === 'all' ? true : d.period_id === periodFilter))
-        .filter((d) => (statusFilter === 'all' ? true : d.status === statusFilter))
-        .filter((d) => {
-          if (reportType === 'delayed') {
-            const ageDays = (now - new Date(d.created_at).getTime()) / (1000 * 3600 * 24);
-            return ageDays > 180 && d.current_stage !== 'completed';
-          }
-          return true;
-        })
-        .map((d) => ({
-          id: d.id,
-          NIM: d.student?.nim_nip || '—',
-          Mahasiswa: d.student?.full_name || '—',
-          Prodi: d.program?.name || '—',
-          Judul: d.title,
-          Tahap: d.current_stage,
-          Status: d.status,
-          Tanggal: formatDateTime(d.created_at),
-          _rawDate: d.created_at,
-        }));
-    } else if (reportType === 'supervisees') {
-      const { data } = await supabase
-        .from('thesis_supervisors')
-        .select('*, student:profiles!thesis_supervisors_student_id_fkey(*), lecturer:profiles!thesis_supervisors_lecturer_id_fkey(*), thesis:thesis_submissions(title, program_id)')
-        .eq('status', 'active');
-      result = (data || [])
-        .filter((d) => (programFilter === 'all' ? true : d.thesis?.program_id === programFilter))
-        .map((d) => ({
-          id: d.id,
-          NIM: d.student?.nim_nip || '—',
-          Mahasiswa: d.student?.full_name || '—',
-          Pembimbing: d.lecturer?.full_name || '—',
-          Peran: d.supervisor_role === 'primary' ? 'Pembimbing 1' : 'Pembimbing 2',
-          Judul: d.thesis?.title || '—',
-          Tanggal: formatDateTime(d.assigned_at),
-          _rawDate: d.assigned_at,
-        }));
-    } else if (reportType === 'seminars') {
-      const { data } = await supabase
-        .from('seminar_registrations')
-        .select('*, student:profiles!seminar_registrations_student_id_fkey(*), thesis:thesis_submissions(title, program_id)');
-      result = (data || [])
-        .filter((d) => (programFilter === 'all' ? true : d.thesis?.program_id === programFilter))
-        .filter((d) => (statusFilter === 'all' ? true : d.status === statusFilter))
-        .map((d) => ({
-          id: d.id,
-          NIM: d.student?.nim_nip || '—',
-          Mahasiswa: d.student?.full_name || '—',
-          Judul: d.thesis?.title || '—',
-          Status: d.status,
-          Tanggal: formatDateTime(d.submitted_at || d.created_at),
-          _rawDate: d.created_at,
-        }));
-    } else if (reportType === 'defenses') {
-      const { data } = await supabase
-        .from('defense_registrations')
-        .select('*, student:profiles!defense_registrations_student_id_fkey(*), thesis:thesis_submissions(title, program_id)');
-      result = (data || [])
-        .filter((d) => (programFilter === 'all' ? true : d.thesis?.program_id === programFilter))
-        .filter((d) => (statusFilter === 'all' ? true : d.status === statusFilter))
-        .map((d) => ({
-          id: d.id,
-          NIM: d.student?.nim_nip || '—',
-          Mahasiswa: d.student?.full_name || '—',
-          Judul: d.thesis?.title || '—',
-          Status: d.status,
-          Tanggal: formatDateTime(d.submitted_at || d.created_at),
-          _rawDate: d.created_at,
-        }));
-    } else if (reportType === 'scores') {
-      const { data } = await supabase
-        .from('exam_scores')
-        .select('*, examiner:profiles!exam_scores_examiner_id_fkey(*), thesis:thesis_submissions(title, program_id, student:profiles!thesis_submissions_student_id_fkey(*))');
-      result = (data || [])
-        .filter((d) => (programFilter === 'all' ? true : d.thesis?.program_id === programFilter))
-        .map((d) => ({
-          id: d.id,
-          NIM: d.thesis?.student?.nim_nip || '—',
-          Mahasiswa: d.thesis?.student?.full_name || '—',
-          Penguji: d.examiner?.full_name || '—',
-          Nilai_Akhir: d.weighted_total,
-          Tanggal: formatDateTime(d.created_at),
-          _rawDate: d.created_at,
-        }));
-    } else if (reportType === 'plagiarism') {
-      const { data } = await supabase
-        .from('plagiarism_checks')
-        .select('*, student:profiles!plagiarism_checks_student_id_fkey(*), thesis:thesis_submissions(program_id)');
-      result = (data || [])
-        .filter((d) => (programFilter === 'all' ? true : d.thesis?.program_id === programFilter))
-        .filter((d) => (statusFilter === 'all' ? true : d.status === statusFilter))
-        .map((d) => ({
-          id: d.id,
-          NIM: d.student?.nim_nip || '—',
-          Mahasiswa: d.student?.full_name || '—',
-          Persentase: d.similarity_percent !== null ? `${d.similarity_percent}%` : '—',
-          Batas: `${d.max_allowed_percent}%`,
-          Status: d.status,
-          Tanggal: formatDateTime(d.created_at),
-          _rawDate: d.created_at,
-        }));
-    } else {
-      const { data } = await supabase
-        .from('graduation_records')
-        .select('*, student:profiles!graduation_records_student_id_fkey(*), thesis:thesis_submissions(program_id)');
-      result = (data || [])
-        .filter((d) => (programFilter === 'all' ? true : d.thesis?.program_id === programFilter))
-        .filter((d) => (reportType === 'graduations' ? d.status === 'graduated' : true))
-        .filter((d) => (statusFilter === 'all' ? true : d.status === statusFilter))
-        .map((d) => ({
-          id: d.id,
-          NIM: d.student?.nim_nip || '—',
-          Mahasiswa: d.student?.full_name || '—',
-          Periode: d.yudisium_period || '—',
-          Nilai: d.final_score ?? '—',
-          Grade: d.final_grade || '—',
-          Status: d.status,
-          Tanggal: formatDateTime(d.created_at),
-          _rawDate: d.created_at,
-        }));
-    }
-
-    if (dateFrom || dateTo) {
-      result = result.filter((r) => {
-        const dt = new Date(String(r._rawDate)).getTime();
-        if (dateFrom && dt < new Date(dateFrom).getTime()) return false;
-        if (dateTo && dt > new Date(dateTo).getTime() + 86400000) return false;
-        return true;
-      });
-    }
-
-    setRows(result);
+    const result = await fetchAcademicReportData({
+      reportType,
+      programFilter,
+      periodFilter,
+      statusFilter,
+      dateFrom,
+      dateTo,
+    });
+    setDataset(result);
     setLoading(false);
   }, [reportType, programFilter, periodFilter, statusFilter, dateFrom, dateTo]);
 
@@ -216,60 +119,280 @@ export function ReportsPage() {
     fetchReport();
   }, [fetchReport]);
 
-  const keys = rows.length > 0 ? Object.keys(rows[0]).filter((k) => k !== 'id' && k !== '_rawDate') : ['Info'];
+  const displayedRows = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase();
+    if (!q) return dataset.rows;
+    return dataset.rows.filter((row) =>
+      Object.entries(row).some(([k, v]) => {
+        if (k === 'id' || k.startsWith('_')) return false;
+        return String(v ?? '').toLowerCase().includes(q);
+      })
+    );
+  }, [dataset.rows, searchQuery]);
+
+  const buildPdfBlob = useCallback((): { blob: Blob; filename: string } => {
+    const selectedProgram = programs.find((p) => p.id === programFilter) || null;
+    const selectedPeriod = periods.find((p) => p.id === periodFilter) || null;
+    const institutionName = systemSettings?.app_name?.trim() || 'TAFlow';
+    const facultyName =
+      selectedProgram?.department?.name ||
+      profile?.department?.name ||
+      'Semua Fakultas Akademik';
+    const programName = selectedProgram
+      ? `${selectedProgram.degree_level} ${selectedProgram.name}`
+      : 'Semua Program Studi';
+    const periodLabel = selectedPeriod
+      ? `${selectedPeriod.name} (${selectedPeriod.academic_year})`
+      : activePeriod
+        ? `Semua Periode (Aktif: ${activePeriod.name})`
+        : 'Semua Periode';
+    const dateRangeLabel =
+      dateFrom || dateTo
+        ? `${dateFrom ? formatDate(dateFrom) : 'Awal'} s/d ${dateTo ? formatDate(dateTo) : 'Sekarang'}`
+        : 'Semua Tanggal';
+
+    const signerName =
+      selectedProgram?.department?.dean_name ||
+      profile?.department?.dean_name ||
+      (profile ? formatLecturerAcademicName(profile) : 'Administrator Akademik');
+    const signerTitle = selectedProgram?.department?.name
+      ? `Dekan ${selectedProgram.department.name}`
+      : selectedProgram
+        ? `Ketua Program Studi ${selectedProgram.name}`
+        : 'Administrator Akademik TA FLOW';
+
+    const blob = generateAcademicReportPdf({
+      reportType,
+      reportTitle: dataset.title,
+      reportSubtitle: dataset.subtitle,
+      institutionName,
+      facultyName,
+      programName,
+      periodLabel,
+      dateRangeLabel,
+      generatedBy: profile?.full_name || 'Administrator',
+      generatedByRole: formatRoleLabel(profile?.role_code),
+      generatedAt: formatDateTime(new Date().toISOString()),
+      signerName,
+      signerTitle,
+      signerNip: profile?.nim_nip || null,
+      contactEmail: systemSettings?.email_config?.sender_email || null,
+      rows: displayedRows,
+      stats: dataset.stats,
+    });
+
+    const dateStamp = new Date().toISOString().slice(0, 10);
+    const filename = `taflow_laporan_${reportType}_${dateStamp}.pdf`;
+    return { blob, filename };
+  }, [
+    programs,
+    programFilter,
+    periods,
+    periodFilter,
+    systemSettings,
+    profile,
+    activePeriod,
+    dateFrom,
+    dateTo,
+    reportType,
+    dataset.title,
+    dataset.subtitle,
+    dataset.stats,
+    displayedRows,
+  ]);
+
+  const handlePreviewPdf = async () => {
+    setPdfBusy('preview');
+    try {
+      const { blob, filename } = buildPdfBlob();
+      const nextUrl = URL.createObjectURL(blob);
+      setPreviewUrl((prev) => {
+        if (prev) URL.revokeObjectURL(prev);
+        return nextUrl;
+      });
+      setPreviewFilename(filename);
+      setPreviewOpen(true);
+    } catch (err) {
+      showToast(
+        'Gagal membuat pratinjau PDF',
+        'error',
+        err instanceof Error ? err.message : 'Terjadi kesalahan saat menyusun PDF.'
+      );
+    } finally {
+      setPdfBusy(null);
+    }
+  };
+
+  const handleDownloadPdf = async (existingUrl?: string, existingName?: string) => {
+    setPdfBusy('download');
+    try {
+      let urlToDownload = existingUrl;
+      let fileToSave = existingName;
+      let tempCreated = false;
+
+      if (!urlToDownload || !fileToSave) {
+        const { blob, filename } = buildPdfBlob();
+        urlToDownload = URL.createObjectURL(blob);
+        fileToSave = filename;
+        tempCreated = true;
+      }
+
+      const anchor = document.createElement('a');
+      anchor.href = urlToDownload;
+      anchor.download = fileToSave;
+      document.body.appendChild(anchor);
+      anchor.click();
+      document.body.removeChild(anchor);
+
+      if (tempCreated) {
+        setTimeout(() => URL.revokeObjectURL(urlToDownload!), 1500);
+      }
+
+      await logActivity('export_academic_report_pdf', 'reports', null, {
+        report_type: reportType,
+        row_count: displayedRows.length,
+      });
+      showToast('PDF laporan berhasil diunduh', 'success');
+    } catch (err) {
+      showToast(
+        'Gagal mengunduh PDF',
+        'error',
+        err instanceof Error ? err.message : 'Terjadi kesalahan saat mengunduh PDF.'
+      );
+    } finally {
+      setPdfBusy(null);
+    }
+  };
+
+  const handlePrintPdf = async (existingUrl?: string) => {
+    setPdfBusy('print');
+    try {
+      let urlToPrint = existingUrl;
+      if (!urlToPrint) {
+        const { blob } = buildPdfBlob();
+        urlToPrint = URL.createObjectURL(blob);
+        setPrintBlobUrl((prev) => {
+          if (prev) URL.revokeObjectURL(prev);
+          return urlToPrint!;
+        });
+      }
+
+      const frame = printIframeRef.current;
+      if (frame) {
+        frame.src = urlToPrint;
+        frame.onload = () => {
+          try {
+            frame.contentWindow?.focus();
+            frame.contentWindow?.print();
+          } catch {
+            window.print();
+          }
+        };
+      } else {
+        window.print();
+      }
+    } catch {
+      window.print();
+    } finally {
+      setPdfBusy(null);
+    }
+  };
+
+  const keys =
+    displayedRows.length > 0
+      ? Object.keys(displayedRows[0]).filter((k) => k !== 'id' && !k.startsWith('_'))
+      : ['Info'];
 
   const columns: ColumnDef<Record<string, string | number>>[] = keys.map((k) => ({
     key: k,
     header: k.replace(/_/g, ' '),
-    render: (r) => <span className="max-w-xs block truncate">{String(r[k] ?? '—')}</span>,
+    sortValue: (r) => r[k] ?? '',
+    render: (r) => (
+      <span className="max-w-xs block truncate" title={String(r[k] ?? '—')}>
+        {String(r[k] ?? '—')}
+      </span>
+    ),
   }));
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 no-print">
+      <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 no-print">
         <div>
           <h1 className="text-xl font-bold tracking-tight">Laporan Akademik</h1>
           <p className="text-xs text-slate-500 mt-0.5">
-            Ekspor CSV/Excel atau cetak laporan resmi untuk 10 kategori proses tugas akhir.
+            Ekspor CSV, pratinjau langsung, cetak, atau unduh PDF resmi untuk seluruh 10 kategori laporan tugas akhir.
           </p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <button
             type="button"
             onClick={() =>
-              exportToCsv(
-                `taflow_report_${reportType}.csv`,
-                rows.map(({ id: _i, _rawDate: _r, ...rest }) => rest)
-              )
+              exportToCsv(`taflow_report_${reportType}.csv`, stripInternalFields(displayedRows))
             }
-            disabled={rows.length === 0}
-            className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 disabled:opacity-50"
+            disabled={displayedRows.length === 0 || loading}
+            className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-50 transition-colors"
           >
             <Download className="w-3.5 h-3.5" />
             Export CSV
           </button>
           <button
             type="button"
-            onClick={() => window.print()}
-            className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium rounded-lg bg-blue-700 text-white"
+            onClick={handlePreviewPdf}
+            disabled={loading || pdfBusy !== null}
+            className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-50 transition-colors"
           >
-            <Printer className="w-3.5 h-3.5" />
-            Cetak / Export PDF
+            {pdfBusy === 'preview' ? (
+              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+            ) : (
+              <Eye className="w-3.5 h-3.5 text-blue-600 dark:text-cyan-400" />
+            )}
+            Preview PDF
+          </button>
+          <button
+            type="button"
+            onClick={() => handlePrintPdf()}
+            disabled={loading || pdfBusy !== null}
+            className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-50 transition-colors"
+          >
+            {pdfBusy === 'print' ? (
+              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+            ) : (
+              <Printer className="w-3.5 h-3.5" />
+            )}
+            Cetak PDF
+          </button>
+          <button
+            type="button"
+            onClick={() => handleDownloadPdf()}
+            disabled={loading || pdfBusy !== null}
+            className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium rounded-lg bg-blue-700 hover:bg-blue-800 text-white disabled:opacity-50 transition-colors"
+          >
+            {pdfBusy === 'download' ? (
+              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+            ) : (
+              <FileDown className="w-3.5 h-3.5" />
+            )}
+            Download PDF
           </button>
         </div>
       </div>
 
       {/* Filters */}
-      <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-3 text-xs no-print">
+      <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-7 gap-3 text-xs no-print">
         <div className="lg:col-span-2">
           <label className="block font-medium mb-1">Jenis Laporan</label>
           <select
             value={reportType}
-            onChange={(e) => setReportType(e.target.value as ReportType)}
+            onChange={(e) => {
+              setReportType(e.target.value as ReportType);
+              setStatusFilter('all');
+            }}
             className="w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950"
           >
             {REPORT_TYPES.map((rt) => (
-              <option key={rt.id} value={rt.id}>{rt.label}</option>
+              <option key={rt.id} value={rt.id}>
+                {rt.label}
+              </option>
             ))}
           </select>
         </div>
@@ -281,7 +404,11 @@ export function ReportsPage() {
             className="w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950"
           >
             <option value="all">Semua Prodi</option>
-            {programs.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+            {programs.map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.name}
+              </option>
+            ))}
           </select>
         </div>
         <div>
@@ -292,27 +419,137 @@ export function ReportsPage() {
             className="w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950"
           >
             <option value="all">Semua Periode</option>
-            {periods.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+            {periods.map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.name}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div>
+          <label className="block font-medium mb-1">Status</label>
+          <select
+            value={statusFilter}
+            onChange={(e) => setStatusFilter(e.target.value)}
+            className="w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950"
+          >
+            <option value="all">Semua Status</option>
+            {dataset.availableStatuses.map((st) => (
+              <option key={st} value={st}>
+                {st.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())}
+              </option>
+            ))}
           </select>
         </div>
         <div>
           <label className="block font-medium mb-1">Dari Tanggal</label>
-          <input type="date" value={dateFrom} onChange={(e) => setDateFrom(e.target.value)} className="w-full px-3 py-2 font-mono rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950" />
+          <input
+            type="date"
+            value={dateFrom}
+            onChange={(e) => setDateFrom(e.target.value)}
+            className="w-full px-3 py-2 font-mono rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950"
+          />
         </div>
         <div>
           <label className="block font-medium mb-1">Sampai Tanggal</label>
-          <input type="date" value={dateTo} onChange={(e) => setDateTo(e.target.value)} className="w-full px-3 py-2 font-mono rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950" />
+          <input
+            type="date"
+            value={dateTo}
+            onChange={(e) => setDateTo(e.target.value)}
+            className="w-full px-3 py-2 font-mono rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950"
+          />
         </div>
       </div>
 
+      {/* Live Summary Strip matching PDF Stats */}
+      {!loading && dataset.stats.length > 0 && (
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 no-print">
+          {dataset.stats.map((st, idx) => (
+            <div
+              key={idx}
+              className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-4"
+            >
+              <p className="text-[11px] font-medium text-slate-500 dark:text-slate-400">
+                {st.label}
+              </p>
+              <p className="text-xl font-bold font-mono tabular-nums mt-1 text-slate-900 dark:text-slate-100">
+                {st.value}
+              </p>
+              {st.hint && (
+                <p className="text-[11px] text-slate-400 dark:text-slate-500 mt-0.5">{st.hint}</p>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
       <DataTable
-        data={rows}
+        data={displayedRows}
         columns={columns}
         keyField={(r) => String(r.id)}
         loading={loading}
         emptyTitle="Tidak ada data laporan"
-        emptyDescription="Sesuaikan filter tanggal, program studi, atau periode akademik."
+        emptyDescription="Sesuaikan filter tanggal, program studi, status, atau periode akademik."
+        toolbarExtra={
+          <div className="relative w-full sm:w-64">
+            <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+            <input
+              type="text"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              placeholder="Cari NIM, nama, judul, atau status..."
+              className="w-full pl-8 pr-3 py-1.5 text-xs rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950 focus:outline-none focus:ring-2 focus:ring-blue-600/30 focus:border-blue-600"
+            />
+          </div>
+        }
       />
+
+      {/* Hidden iframe for direct PDF printing without window.open */}
+      <iframe
+        ref={printIframeRef}
+        title="Print Report PDF Frame"
+        className="hidden"
+        aria-hidden="true"
+      />
+
+      {/* Real PDF Preview Modal */}
+      <Modal
+        open={previewOpen}
+        onClose={() => setPreviewOpen(false)}
+        title={`Preview PDF — ${dataset.title}`}
+        subtitle={`Dokumen A4 aktual sesuai filter (${displayedRows.length} baris data)`}
+        maxWidth="2xl"
+        footer={
+          previewUrl ? (
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={() => handlePrintPdf(previewUrl)}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium rounded-lg border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
+              >
+                <Printer className="w-3.5 h-3.5" />
+                <span>Cetak PDF</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => handleDownloadPdf(previewUrl, previewFilename)}
+                className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-medium rounded-lg bg-blue-700 hover:bg-blue-800 text-white transition-colors"
+              >
+                <FileDown className="w-3.5 h-3.5" />
+                <span>Download PDF</span>
+              </button>
+            </div>
+          ) : null
+        }
+      >
+        {previewUrl && (
+          <iframe
+            src={previewUrl}
+            title={dataset.title}
+            className="w-full h-[72vh] rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-100 dark:bg-slate-950"
+          />
+        )}
+      </Modal>
     </div>
   );
 }
